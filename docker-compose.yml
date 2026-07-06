@@ -1,0 +1,89 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: whatsapp_bot
+      POSTGRES_PASSWORD: whatsapp_bot
+      POSTGRES_DB: whatsapp_bot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whatsapp_bot -d whatsapp_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
+      QUEUE_NAME: "${QUEUE_NAME:-default}"
+      WEB_CONCURRENCY: "${WEB_CONCURRENCY:-8}"
+      DB_POOL_MIN_SIZE: "${DB_POOL_MIN_SIZE:-2}"
+      DB_POOL_MAX_SIZE: "${DB_POOL_MAX_SIZE:-8}"
+    command: ["./start.sh", "${WEB_CONCURRENCY:-8}"]
+    expose:
+      - "8000"
+    volumes:
+      - audio_storage:/app/audio_storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
+      QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
+      QUEUE_NAME: "${QUEUE_NAME:-default}"
+    command: ["python", "worker.py"]
+    volumes:
+      - audio_storage:/app/audio_storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  pg_data:
+  redis_data:
+  audio_storage:
