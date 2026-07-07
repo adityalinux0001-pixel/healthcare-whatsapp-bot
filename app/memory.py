@@ -130,6 +130,16 @@ class ConversationMemory:
                 )
             ''')
 
+            # Migration for existing installs: which premium plan category
+            # this user is on ('weight_loss', 'yoga', 'bulking', ...).
+            # Defaults to settings.default_plan_category at the point the
+            # column is added; new rows get the DEFAULT below unless
+            # onboarding explicitly sets something else.
+            cur.execute('''
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'weight_loss'
+            ''')
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS chat_history (
                     id BIGSERIAL PRIMARY KEY,
@@ -239,6 +249,78 @@ class ConversationMemory:
                 CREATE TABLE IF NOT EXISTS symptom_sessions (
                     phone_number TEXT PRIMARY KEY,
                     question_count INTEGER NOT NULL DEFAULT 0,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            ''')
+
+            # ----------------------------------------------------------------
+            # PREMIUM PLAN PREGENERATION
+            # ----------------------------------------------------------------
+            # One row per (user, day_number) for the ENTIRE plan, written all
+            # at once right after onboarding finishes (one LLM call — see
+            # app/llm.py::generate_premium_plan). The daily scheduler
+            # (app/daily_checkin.py) does zero LLM calls: it just reads the
+            # row for today's day_number and sends message_text. sent_at
+            # stays NULL until the scheduler actually sends that day, which
+            # both tells the scheduler which day is next AND lets a human
+            # QA all 21 messages before any of them go out.
+            #
+            # followup_question is generated in the same LLM call and asked
+            # the SAME DAY right after message_text is sent. followup_answer
+            # /followup_answered_at are filled in later by the normal
+            # webhook flow when the user replies — this is logging only in
+            # the current design: it does NOT regenerate or alter any other
+            # day's message_text.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS premium_plans (
+                    id BIGSERIAL PRIMARY KEY,
+                    phone_number TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'weight_loss',
+                    day_number INTEGER NOT NULL,
+                    message_text TEXT NOT NULL,
+                    followup_question TEXT,
+                    followup_answer TEXT,
+                    followup_answered_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    sent_at TIMESTAMPTZ,
+                    -- awaiting_followup marks the window between "today's
+                    -- message was just sent" and "the user has answered (or
+                    -- the next day's message supersedes it)" — the webhook
+                    -- handler in app/main.py checks this to decide whether
+                    -- an incoming text should be captured as this day's
+                    -- follow-up answer instead of going through the normal
+                    -- Q&A path.
+                    awaiting_followup BOOLEAN NOT NULL DEFAULT FALSE,
+                    UNIQUE (phone_number, day_number)
+                )
+            ''')
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_premium_plans_phone_day
+                ON premium_plans(phone_number, day_number)
+            ''')
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_premium_plans_awaiting
+                ON premium_plans(phone_number, awaiting_followup)
+                WHERE awaiting_followup = TRUE
+            ''')
+
+            # ----------------------------------------------------------------
+            # ONBOARDING (the short question flow run once, right after
+            # subscribe, before the single plan-generation LLM call)
+            # ----------------------------------------------------------------
+            # One row per user's IN-PROGRESS onboarding. answers accumulates
+            # as JSONB while question_index advances; once the last question
+            # is answered, app/onboarding.py triggers plan generation and
+            # this row can be left as a completed record (is_complete=TRUE)
+            # or cleared — kept here for audit/debugging.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS onboarding_sessions (
+                    phone_number TEXT PRIMARY KEY,
+                    category TEXT NOT NULL DEFAULT 'weight_loss',
+                    question_index INTEGER NOT NULL DEFAULT 0,
+                    answers JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    is_complete BOOLEAN NOT NULL DEFAULT FALSE,
                     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
@@ -642,6 +724,201 @@ class ConversationMemory:
                 WHERE expires_at > now()
             ''')
             return [dict(row) for row in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Premium plan pregeneration (21 rows written once, sent one/day)
+    # ------------------------------------------------------------------
+
+    def save_premium_plan(self, phone_number: str, category: str, days: List[Dict]) -> None:
+        """
+        Persist the ENTIRE pregenerated plan in one transaction: `days` is
+        a list of {"message": str, "followup_question": str} in day order
+        (index 0 = day 1), as returned by
+        app.llm.generate_premium_plan(). Called exactly once, right after
+        onboarding finishes — see app/onboarding.py.
+
+        Replaces any existing plan rows for this user first (safe to call
+        again if, say, an operator wants to regenerate a user's plan from
+        scratch), so this is idempotent per call.
+        """
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM premium_plans WHERE phone_number = %s", (phone_number,))
+            for day_number, day in enumerate(days, start=1):
+                cur.execute('''
+                    INSERT INTO premium_plans
+                        (phone_number, category, day_number, message_text, followup_question)
+                    VALUES (%s, %s, %s, %s, %s)
+                ''', (phone_number, category, day_number, day["message"], day["followup_question"]))
+            cur.execute('''
+                INSERT INTO users (phone_number, category)
+                VALUES (%s, %s)
+                ON CONFLICT (phone_number) DO UPDATE SET category = EXCLUDED.category
+            ''', (phone_number, category))
+            conn.commit()
+        logger.info(f"✅ Saved {len(days)}-day '{category}' premium plan for {phone_number}")
+
+    def get_premium_plan_day(self, phone_number: str, day_number: int) -> Optional[Dict]:
+        """Fetch the pre-written row for a specific day — this is the ONLY
+        thing the daily scheduler does to get content; no LLM call."""
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute('''
+                SELECT * FROM premium_plans
+                WHERE phone_number = %s AND day_number = %s
+            ''', (phone_number, day_number))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_next_unsent_plan_day(self, phone_number: str) -> Optional[Dict]:
+        """The lowest-numbered day for this user that hasn't been sent yet
+        (sent_at IS NULL) — this IS the "compute current day number" +
+        "fetch row" step from the architecture diagram, combined: instead
+        of separately counting elapsed days, we just take whichever
+        pregenerated row is next in line. Returns None once all days (or
+        no plan at all) exist."""
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute('''
+                SELECT * FROM premium_plans
+                WHERE phone_number = %s AND sent_at IS NULL
+                ORDER BY day_number ASC
+                LIMIT 1
+            ''', (phone_number,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def mark_plan_day_sent(self, phone_number: str, day_number: int) -> None:
+        """Mark today's row as sent and open the same-day follow-up
+        window (awaiting_followup=TRUE) so the next incoming text message
+        from this user is captured as the answer to THIS day's
+        followup_question instead of going through normal Q&A."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE premium_plans
+                SET sent_at = now(), awaiting_followup = TRUE
+                WHERE phone_number = %s AND day_number = %s
+            ''', (phone_number, day_number))
+            conn.commit()
+
+    def get_awaiting_followup_day(self, phone_number: str) -> Optional[Dict]:
+        """The plan day (if any) currently waiting on a same-day follow-up
+        answer from this user. Checked by the webhook handler on every
+        incoming text so a reply right after a check-in gets logged
+        against the right day instead of just vanishing into normal chat."""
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute('''
+                SELECT * FROM premium_plans
+                WHERE phone_number = %s AND awaiting_followup = TRUE
+                ORDER BY day_number DESC
+                LIMIT 1
+            ''', (phone_number,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def save_followup_answer(self, phone_number: str, day_number: int, answer: str) -> None:
+        """Log the user's same-day follow-up answer and close the
+        follow-up window. IMPORTANT: this only writes to this one row —
+        by design (see architecture) it never touches message_text for
+        any other day. Every other day's content stays exactly as
+        pregenerated."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE premium_plans
+                SET followup_answer = %s, followup_answered_at = now(), awaiting_followup = FALSE
+                WHERE phone_number = %s AND day_number = %s
+            ''', (answer, phone_number, day_number))
+            conn.commit()
+
+    def has_premium_plan(self, phone_number: str) -> bool:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM premium_plans WHERE phone_number = %s LIMIT 1",
+                (phone_number,),
+            )
+            return cur.fetchone() is not None
+
+    def get_user_category(self, phone_number: str) -> Optional[str]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT category FROM users WHERE phone_number = %s", (phone_number,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    # ------------------------------------------------------------------
+    # Onboarding session (subscribe -> category -> questions -> plan gen)
+    # ------------------------------------------------------------------
+
+    def get_onboarding_session(self, phone_number: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute(
+                "SELECT * FROM onboarding_sessions WHERE phone_number = %s",
+                (phone_number,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def start_onboarding_session(self, phone_number: str, category: str) -> None:
+        """Start (or restart from question 1) an onboarding session for
+        this user with the given category. Called right after a
+        subscription is activated (payment webhook) — see
+        app/onboarding.py."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO onboarding_sessions (phone_number, category, question_index, answers, is_complete, started_at, updated_at)
+                VALUES (%s, %s, 0, '{}'::jsonb, FALSE, now(), now())
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    category = EXCLUDED.category,
+                    question_index = 0,
+                    answers = '{}'::jsonb,
+                    is_complete = FALSE,
+                    started_at = now(),
+                    updated_at = now()
+            ''', (phone_number, category))
+            conn.commit()
+
+    def save_onboarding_answer(self, phone_number: str, question_key: str, answer: str) -> int:
+        """Store the answer to the current question under `question_key`,
+        advance question_index by 1, and return the NEW question_index
+        (i.e. which question to ask next)."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE onboarding_sessions
+                SET answers = answers || jsonb_build_object(%s, %s::text),
+                    question_index = question_index + 1,
+                    updated_at = now()
+                WHERE phone_number = %s
+                RETURNING question_index
+            ''', (question_key, answer, phone_number))
+            row = cur.fetchone()
+            conn.commit()
+            return row[0] if row else 0
+
+    def mark_onboarding_complete(self, phone_number: str) -> Dict:
+        """Mark the session complete and return the full accumulated
+        answers dict, ready to hand to app.llm.generate_premium_plan()."""
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute('''
+                UPDATE onboarding_sessions
+                SET is_complete = TRUE, updated_at = now()
+                WHERE phone_number = %s
+                RETURNING answers, category
+            ''', (phone_number,))
+            row = cur.fetchone()
+            conn.commit()
+            return dict(row) if row else {"answers": {}, "category": "weight_loss"}
+
+    def is_onboarding_in_progress(self, phone_number: str) -> bool:
+        session = self.get_onboarding_session(phone_number)
+        return bool(session and not session["is_complete"])
 
     # ------------------------------------------------------------------
     # Symptom intake session (deterministic question-count cap)

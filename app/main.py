@@ -50,6 +50,7 @@ from app.audio_handler import (
 )
 from app.queueing import enqueue_incoming
 from app.razorpay_client import create_payment_link, verify_webhook_signature
+from app.onboarding import start_onboarding, handle_onboarding_reply
 
 # Voice notes longer than this are rejected outright — client requirement.
 MAX_AUDIO_DURATION_SECONDS = 30
@@ -743,6 +744,16 @@ async def razorpay_webhook(request: Request):
         # payment activation or make the webhook look like it failed to Razorpay.
         logger.error(f"❌ Failed to send payment confirmation to {phone_number}: {e}", exc_info=True)
 
+    # ============ ONBOARDING: category selection + questions ============
+    # Kicks off right after subscribe (see the architecture diagram).
+    # Category defaults to settings.default_plan_category ("weight_loss")
+    # for now — a future paywall/menu step could let the user pick before
+    # this call instead of always defaulting.
+    try:
+        await start_onboarding(memory, phone_number, category=settings.default_plan_category)
+    except Exception as e:
+        logger.error(f"❌ Failed to start onboarding for {phone_number}: {e}", exc_info=True)
+
     return {"status": "ok"}
 
 
@@ -807,6 +818,45 @@ async def _handle_incoming(raw_msg: dict) -> None:
     if msg.type == "text" and msg.text:
         user_text = msg.text.body.strip()
         logger.info(f"👤 [{sender}]: {user_text}")
+
+        # ---- ONBOARDING IN PROGRESS: route straight into the question flow ----
+        # Must run before any other text handling (commands, follow-up
+        # capture, normal Q&A) — while onboarding is active, every incoming
+        # text IS the answer to the current onboarding question.
+        try:
+            consumed = await handle_onboarding_reply(memory, sender, user_text)
+            if consumed:
+                return
+        except Exception as e:
+            logger.error(f"❌ Onboarding reply handling failed for {sender}: {e}", exc_info=True)
+
+        # ---- SAME-DAY FOLLOW-UP CAPTURE ----
+        # If this user was just sent today's plan message + follow-up
+        # question (see app/daily_checkin.py), the first text they send
+        # back is logged against that day's followup_answer — per the
+        # architecture, this is logging only and never rewrites any other
+        # day's pregenerated message_text.
+        try:
+            awaiting = await asyncio.to_thread(memory.get_awaiting_followup_day, sender)
+            if awaiting:
+                await asyncio.to_thread(
+                    memory.save_followup_answer, sender, awaiting["day_number"], user_text
+                )
+                await asyncio.to_thread(
+                    memory.save_message, sender, "user", user_text, message_type="text"
+                )
+                logger.info(
+                    f"📝 Logged day {awaiting['day_number']} follow-up answer for {sender}: "
+                    f"'{user_text[:80]}'"
+                )
+                ack = "Thanks for the update! 👍 Keep it up, and I'll check in again tomorrow."
+                await send_text_message(sender, ack)
+                await asyncio.to_thread(
+                    memory.save_message, sender, "assistant", ack, message_type="text"
+                )
+                return
+        except Exception as e:
+            logger.error(f"❌ Follow-up capture failed for {sender}: {e}", exc_info=True)
 
         # Handle special commands
         if user_text.lower() in ("/reset", "/clear", "reset", "clear"):

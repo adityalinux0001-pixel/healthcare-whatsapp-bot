@@ -155,14 +155,38 @@ class Settings(BaseSettings):
     premium_plan_days: int = 21
 
     # Daily health check-in (premium feature) — every day of the 21-day
-    # premium plan, a background job sends the user one personalized
-    # suggestion/to-do (e.g. an exercise, a diet tip, a reminder) based on
-    # their saved health profile + conversation so far, then continues the
-    # conversation from there. hour is in 24h format, UTC by default —
-    # adjust daily_checkin_hour/timezone via .env to match your users.
+    # premium plan, a background job SENDS the pre-generated message for
+    # that day (see PREMIUM PLAN PREGENERATION below — no LLM call happens
+    # here anymore), then a same-day follow-up question is asked and the
+    # conversation continues naturally from the user's reply (handled by
+    # the normal webhook flow in app/main.py). hour is in 24h format, UTC
+    # by default — adjust daily_checkin_hour/timezone via .env to match
+    # your users.
     daily_checkin_enabled: bool = True
     daily_checkin_hour_utc: int = 9
     daily_checkin_min_gap_hours: int = 20
+
+    # ------------------------------------------------------------------
+    # PREMIUM PLAN PREGENERATION (onboarding -> one LLM call -> 21 rows)
+    # ------------------------------------------------------------------
+    # Default plan category. This is the single knob that applies when a
+    # user doesn't pick one explicitly — every current user gets
+    # "weight_loss". Additional categories (e.g. "yoga", "bulking") are
+    # added later purely as new prompt templates in app/llm.py's
+    # PLAN_CATEGORY_PROMPTS dict; nothing else in the pipeline needs to
+    # change to support them.
+    default_plan_category: str = "weight_loss"
+
+    # How long (seconds) a user's onboarding session may sit idle before
+    # a fresh "/premium" or payment restarts it from question 1 instead
+    # of resuming a stale, possibly-abandoned session.
+    onboarding_session_timeout_seconds: int = 60 * 60 * 24
+
+    # Safety ceiling for the single "generate all 21 days" Gemini call —
+    # this one call matters more than a normal chat turn (if it fails,
+    # the whole premium plan fails to materialize), so it gets its own
+    # generous output budget separate from other calls.
+    plan_generation_max_output_tokens: int = 8000
 
     # Symptom intake — hard cap on how many short one-at-a-time questions
     # (see SYMPTOM INTAKE MODE in app/llm.py's SYSTEM_PROMPT) the bot may

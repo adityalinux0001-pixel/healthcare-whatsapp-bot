@@ -1080,3 +1080,207 @@ Write today's check-in message now, following the rules exactly.
     message = _strip_leaked_meta_text(message)
     logger.info(f"Daily check-in (day {day_number}/{total_days}): '{message[:100]}'")
     return message
+
+
+# ============================================================================
+# PREMIUM PLAN PREGENERATION — one LLM call at onboarding, all 21 days
+# ============================================================================
+#
+# Replaces the old "call Gemini once per day" model (generate_daily_checkin_
+# message above, still kept for backward compatibility / manual use) with a
+# single call made right after onboarding finishes. See app/onboarding.py
+# for the question flow that collects the answers passed in here, and
+# app/daily_checkin.py for the scheduler that now just fetches + sends the
+# pre-written row for the day — zero LLM calls on that path.
+#
+# Category support: PLAN_CATEGORY_PROMPTS holds one system-prompt template
+# per plan category. "weight_loss" is the only one wired up today (it's
+# settings.default_plan_category), but adding "yoga", "bulking", etc. later
+# is just adding another entry here — generate_premium_plan() and everything
+# downstream (schema, scheduler, follow-up capture) is already
+# category-agnostic.
+
+import json as _json
+
+
+PLAN_CATEGORY_PROMPTS: dict[str, str] = {
+    "weight_loss": """
+You are a supportive, practical health coach creating a {total_days}-day
+WhatsApp weight-loss micro-coaching plan for one specific person, based on
+the onboarding answers below. This is NOT a diagnosis or medical
+prescription — it is a friendly, safe, day-by-day set of habit nudges
+(food swaps, portion tips, short home exercises, hydration/sleep
+reminders, motivation) that fits the person's real constraints.
+
+Non-negotiable safety rules:
+- Respect every stated medical condition, injury, or restriction exactly.
+  If they mentioned knee pain, never suggest running or jumping. If they
+  mentioned a thyroid/PCOS/diabetes condition, keep suggestions generic
+  and safe rather than prescriptive, and gently note that specific
+  medical/dietary numbers should come from their doctor or dietitian.
+- Respect dietary preference/restrictions in every single food-related day.
+- Respect their stated available time per day — do not suggest a 45 minute
+  workout if they said they have 15-20 minutes.
+- Never mention a specific calorie or macro number as medical fact — general
+  guidance only.
+- Do not repeat the same exact suggestion across multiple days; vary the
+  angle (movement one day, food swap another, mindset/sleep another,
+  etc.) so the {total_days} days feel like a coherent, progressive plan
+  (easier habits early, slightly more challenging by the end).
+- If they mentioned something they've tried before and disliked/it
+  didn't work (e.g. "hate running", "tried keto before"), avoid
+  recommending that same thing.
+""",
+}
+
+
+def _plan_category_system_prompt(category: str, total_days: int) -> str:
+    template = PLAN_CATEGORY_PROMPTS.get(category, PLAN_CATEGORY_PROMPTS["weight_loss"])
+    return template.format(total_days=total_days).strip()
+
+
+_PLAN_OUTPUT_FORMAT_INSTRUCTIONS = """
+[OUTPUT FORMAT — FOLLOW EXACTLY]
+Respond with ONLY a single JSON array, no markdown fences, no preamble, no
+trailing text. The array must have EXACTLY {total_days} objects, one per
+day, in order from day 1 to day {total_days}. Each object has exactly these
+two keys:
+  "message": the WhatsApp message to send that day (plain text, friendly,
+             concise — roughly 2-5 sentences, may include 1-2 relevant
+             emoji, written in {language}).
+  "followup_question": one short question (plain text, one sentence, in
+             {language}) to ask the user later THAT SAME DAY after the
+             message above, to check in on how it went (e.g. "Were you
+             able to try the 10-minute walk today?"). This question is
+             for engagement/logging only — do not reference it as
+             upcoming inside "message" itself.
+
+Example shape (values illustrative only — do not reuse this exact content):
+[
+  {{"message": "Day 1 text...", "followup_question": "Day 1 question?"}},
+  {{"message": "Day 2 text...", "followup_question": "Day 2 question?"}}
+]
+""".strip()
+
+
+async def generate_premium_plan(
+    onboarding_answers: dict,
+    category: str,
+    total_days: int,
+    required_language: str | None = None,
+) -> list[dict]:
+    """
+    ONE Gemini call that generates the entire {total_days}-day premium plan
+    up front: for every day, both the message to send AND that day's
+    same-day follow-up question. Called exactly once, right after
+    onboarding finishes (see app/onboarding.py), and the result is written
+    to the premium_plans table (see app/memory.py) as one row per day.
+
+    No LLM calls happen again for this user's plan after this point — the
+    daily scheduler (app/daily_checkin.py) only ever fetches pre-written
+    rows and sends them.
+
+    Args:
+        onboarding_answers: dict of the answers collected during onboarding
+            (weight/height, goal, diet, activity level, medical conditions,
+            routine/time available, past attempts — see app/onboarding.py
+            for the exact question set).
+        category: plan category, e.g. "weight_loss" (see
+            settings.default_plan_category and PLAN_CATEGORY_PROMPTS above).
+        total_days: length of the plan (settings.premium_plan_days).
+        required_language: language to write in; defaults to English.
+
+    Returns:
+        A list of exactly `total_days` dicts, each shaped
+        {"message": str, "followup_question": str}, in day order
+        (index 0 = day 1).
+
+    Raises:
+        GeminiUnavailableError: Gemini is down/overloaded — caller should
+            NOT activate/save a half-formed plan and should let the
+            subscription-activation flow retry or alert an operator,
+            since silently failing here means the user paid for a premium
+            plan that never materializes.
+        ValueError: Gemini responded but not with valid, complete JSON for
+            all {total_days} days — treated the same as unavailable by
+            callers (don't save a partial/malformed plan).
+    """
+    client = _get_client()
+    language = required_language or "English"
+
+    system_prompt = _plan_category_system_prompt(category, total_days)
+    output_format = _PLAN_OUTPUT_FORMAT_INSTRUCTIONS.format(
+        total_days=total_days, language=language
+    )
+    full_system_prompt = f"{system_prompt}\n\n{output_format}"
+
+    answers_json = _json.dumps(onboarding_answers, indent=2, ensure_ascii=False)
+    prompt = f"""
+[ONBOARDING ANSWERS FOR THIS USER]
+{answers_json}
+
+[PLAN LENGTH]
+{total_days} days
+
+[REQUIRED_LANGUAGE]
+{language}
+
+Generate the full {total_days}-day plan now, following the rules and
+output format exactly.
+""".strip()
+
+    try:
+        response = await _call_gemini(
+            lambda: client.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[types.Part(text=prompt)],
+                config=types.GenerateContentConfig(
+                    system_instruction=full_system_prompt,
+                    max_output_tokens=get_settings().plan_generation_max_output_tokens,
+                    temperature=0.6,
+                    response_mime_type="application/json",
+                ),
+            ),
+            label="premium plan pregeneration",
+        )
+    except Exception as e:
+        if _is_transient_gemini_error(e):
+            logger.warning(f"Gemini unavailable during premium plan pregeneration: {e}")
+            raise GeminiUnavailableError(str(e)) from e
+        raise
+
+    raw_text = (response.text or "").strip()
+
+    try:
+        parsed = _json.loads(raw_text)
+    except _json.JSONDecodeError as e:
+        logger.error(f"❌ Plan pregeneration returned invalid JSON: {e} | raw[:500]={raw_text[:500]}")
+        raise ValueError(f"Invalid JSON from plan generation: {e}") from e
+
+    if not isinstance(parsed, list) or len(parsed) != total_days:
+        logger.error(
+            f"❌ Plan pregeneration returned wrong shape — expected a {total_days}-item "
+            f"list, got {type(parsed).__name__} of len "
+            f"{len(parsed) if isinstance(parsed, list) else 'n/a'}."
+        )
+        raise ValueError(
+            f"Expected {total_days} plan days, got "
+            f"{len(parsed) if isinstance(parsed, list) else type(parsed).__name__}"
+        )
+
+    days: list[dict] = []
+    for i, item in enumerate(parsed, start=1):
+        if not isinstance(item, dict) or "message" not in item or "followup_question" not in item:
+            logger.error(f"❌ Plan pregeneration day {i} malformed: {item!r}")
+            raise ValueError(f"Day {i} missing required keys 'message'/'followup_question'")
+        message = _strip_leaked_meta_text(str(item["message"]).strip())
+        followup_question = str(item["followup_question"]).strip()
+        if not message or not followup_question:
+            raise ValueError(f"Day {i} has an empty message or followup_question")
+        days.append({"message": message, "followup_question": followup_question})
+
+    logger.info(
+        f"✅ Pregenerated {len(days)}-day '{category}' plan in one Gemini call "
+        f"(language={language})."
+    )
+    return days

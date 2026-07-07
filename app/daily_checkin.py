@@ -1,13 +1,25 @@
 """
-Daily premium check-in job.
+Daily premium check-in job — REWRITTEN for the pregeneration architecture.
 
-Part of the 21-day (configurable via settings.premium_plan_days) Premium
-plan: once a day, for every user with an active subscription, generate ONE
-personalized health suggestion/to-do based on their saved profile/summary
-and conversation so far, send it as a WhatsApp message, and record it so
-the conversation can continue naturally from the user's reply (handled by
-the normal webhook flow in app/main.py — a reply to a check-in is just a
-regular incoming message).
+Old behavior: called Gemini once per user, per day, to generate that day's
+message on the fly. New behavior: the entire {premium_plan_days}-day plan
+(message + same-day follow-up question, for every day) is generated ONCE,
+right after onboarding finishes (see app/onboarding.py ->
+app/llm.py::generate_premium_plan -> app/memory.py::save_premium_plan).
+
+This job now does exactly what the architecture diagram says and nothing
+more:
+    1. Compute which day is next for a user (fetch the lowest-numbered
+       unsent row — app/memory.py::get_next_unsent_plan_day).
+    2. Fetch that row, send message_text.
+    3. Mark it sent and open the same-day follow-up window — the actual
+       follow-up QUESTION is sent right after, and the user's reply is
+       captured by the normal webhook flow in app/main.py (see
+       handle_possible_followup_reply there), not by this job.
+
+No LLM call happens anywhere in this file. That means no risk of a Gemini
+outage breaking someone's day-14 message, and a human can review/edit any
+day's premium_plans.message_text in the database before it ever gets sent.
 
 Run this on a schedule (cron, a simple `while True: sleep` loop in a
 container, APScheduler, etc.) — see run_daily_checkins() below for the
@@ -16,12 +28,11 @@ single entry point one job invocation should call once per day.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from app.config import get_settings
 from app.memory import ConversationMemory
 from app.whatsapp import send_text_message
-from app.llm import generate_daily_checkin_message, detect_reply_language, GeminiUnavailableError
 
 logger = logging.getLogger("daily_checkin")
 
@@ -34,13 +45,11 @@ memory = ConversationMemory(
 )
 
 
-async def _send_checkin_for_user(phone_number: str, started_at: datetime) -> None:
-    """Generate and send today's check-in for a single active-premium user,
-    unless one was already sent too recently (throttle) or the plan's day
-    count has been exhausted."""
+async def _send_checkin_for_user(phone_number: str) -> None:
+    """Send the next pregenerated, not-yet-sent plan day for one user, if
+    any is due and the throttle allows it. Pure fetch-and-send — no LLM
+    call."""
     now = datetime.utcnow()
-    if started_at.tzinfo is not None:
-        started_at = started_at.replace(tzinfo=None)
 
     # Throttle: don't send a second check-in within
     # daily_checkin_min_gap_hours of the last one for this user (covers
@@ -58,72 +67,56 @@ async def _send_checkin_for_user(phone_number: str, started_at: datetime) -> Non
             )
             return
 
-    # How many check-ins already sent since the plan started = the day
-    # number we're about to send (1-indexed).
-    sent_so_far = await asyncio.to_thread(memory.get_checkins_sent_count, phone_number, started_at)
-    day_number = sent_so_far + 1
-
-    if day_number > settings.premium_plan_days:
+    # Step "Compute current day number" + "Fetch row" from the
+    # architecture diagram, combined: whichever pregenerated day hasn't
+    # been sent yet IS today's day.
+    plan_day = await asyncio.to_thread(memory.get_next_unsent_plan_day, phone_number)
+    if plan_day is None:
         logger.info(
-            f"⏭️ Skipping check-in for {phone_number} — plan's "
-            f"{settings.premium_plan_days} check-ins already sent."
+            f"⏭️ No pending pregenerated plan day for {phone_number} — "
+            f"either the plan is fully sent or was never generated (no onboarding completed)."
         )
         return
 
-    try:
-        customer_data = await asyncio.to_thread(memory.get_customer, phone_number)
-        context_text = await asyncio.to_thread(memory.get_conversation_context, phone_number, limit=5)
-        recent_checkins = await asyncio.to_thread(memory.get_recent_checkin_messages, phone_number, limit=5)
-
-        customer_summary = customer_data.get("summary", "")
-
-        # No "current user message" to detect language from for a
-        # proactive message — fall back to whatever language the user's
-        # last real message was in, detected from the recent context text
-        # if available, else default to English inside the generator.
-        required_language = None
-        if context_text:
-            required_language = await detect_reply_language(context_text[-500:])
-
-        message = await generate_daily_checkin_message(
-            customer_summary=customer_summary,
-            context_text=context_text,
-            day_number=day_number,
-            total_days=settings.premium_plan_days,
-            recent_suggestions=recent_checkins,
-            required_language=required_language,
-        )
-    except GeminiUnavailableError:
-        logger.warning(f"⏭️ Skipped check-in for {phone_number} — Gemini unavailable, will retry next run.")
-        return
-    except Exception as e:
-        logger.error(f"❌ Failed to generate check-in for {phone_number}: {e}", exc_info=True)
-        return
-
-    if not message:
-        logger.warning(f"⏭️ Empty check-in message generated for {phone_number}, skipping send.")
-        return
+    day_number = plan_day["day_number"]
+    message = plan_day["message_text"]
+    followup_question = plan_day.get("followup_question")
 
     try:
         await send_text_message(phone_number, message)
-        await asyncio.to_thread(memory.save_daily_checkin, phone_number, day_number, message)
+        await asyncio.to_thread(memory.mark_plan_day_sent, phone_number, day_number)
         await asyncio.to_thread(
             memory.save_message, phone_number, "assistant", message, message_type="text"
         )
         logger.info(f"✅ Sent day {day_number}/{settings.premium_plan_days} check-in to {phone_number}")
     except Exception as e:
         logger.error(f"❌ Failed to send/save check-in for {phone_number}: {e}", exc_info=True)
+        return
+
+    # Same-day follow-up question, sent right after the day's message.
+    # The user's reply is captured by app/main.py's webhook handler
+    # (checks memory.get_awaiting_followup_day before normal Q&A routing)
+    # — this job's job ends here.
+    if followup_question:
+        try:
+            await send_text_message(phone_number, followup_question)
+            await asyncio.to_thread(
+                memory.save_message, phone_number, "assistant", followup_question, message_type="text"
+            )
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to send follow-up question for {phone_number} day {day_number}: {e}",
+                exc_info=True,
+            )
 
 
 async def run_daily_checkins() -> None:
     """
     Single entry point for one day's run: fetch every user with an
-    active premium subscription and send each of them their check-in for
-    today, one at a time (sequential — this runs once a day, not on the
-    hot request path, so there's no latency pressure to parallelize it;
-    keeping it sequential also naturally respects the shared Gemini
-    concurrency limiter in app/llm.py instead of bursting all requests at
-    once).
+    active premium subscription and send each of them their next
+    pregenerated check-in, one at a time (sequential — this runs once a
+    day, not on the hot request path, so there's no latency pressure to
+    parallelize it).
     """
     if not settings.daily_checkin_enabled:
         logger.info("Daily check-in feature disabled (daily_checkin_enabled=False) — skipping run.")
@@ -134,9 +127,8 @@ async def run_daily_checkins() -> None:
 
     for user in users:
         phone_number = user["phone_number"]
-        started_at = user["started_at"]
         try:
-            await _send_checkin_for_user(phone_number, started_at)
+            await _send_checkin_for_user(phone_number)
         except Exception as e:
             logger.error(f"❌ Unhandled error sending check-in to {phone_number}: {e}", exc_info=True)
 
