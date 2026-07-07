@@ -985,6 +985,10 @@ Rules:
 - Exactly ONE suggestion or to-do per message — do not list multiple.
 - Keep it short: 2-4 sentences, WhatsApp style, no markdown, no headers,
   no bullet dashes.
+- Include 2-3 relevant emoji to keep it warm and interactive (e.g. 💪 for
+  motivation, 🥗 for food, 💧 for hydration, 🚶‍♂️ for movement, 😴 for
+  sleep, ✅ for progress) — don't overdo it, and don't replace real words
+  with emoji.
 - Sound like a caring health coach checking in, not a generic notification.
   Mention today is part of their plan naturally (e.g. "Day {day_number} of
   your plan" is fine to include once).
@@ -1146,19 +1150,32 @@ trailing text. The array must have EXACTLY {total_days} objects, one per
 day, in order from day 1 to day {total_days}. Each object has exactly these
 two keys:
   "message": the WhatsApp message to send that day (plain text, friendly,
-             concise — roughly 2-5 sentences, may include 1-2 relevant
-             emoji, written in {language}).
+             concise — roughly 2-5 sentences, written in {language}).
+             Include 2-3 well-placed emoji that make the message feel
+             warm and interactive rather than a plain notification —
+             e.g. 💪 for effort/motivation, 🥗🍎 for food/diet tips,
+             💧 for hydration, 🚶‍♂️🏃‍♀️ for movement/exercise, 😴 for
+             sleep, ✅ for a completed habit, 🎯 for a goal/target. Vary
+             which emoji you use day to day so the plan doesn't feel
+             repetitive — don't reuse the exact same emoji combo on
+             consecutive days.
   "followup_question": one short question (plain text, one sentence, in
              {language}) to ask the user later THAT SAME DAY after the
              message above, to check in on how it went (e.g. "Were you
-             able to try the 10-minute walk today?"). This question is
-             for engagement/logging only — do not reference it as
-             upcoming inside "message" itself.
+             able to try the 10-minute walk today? 🚶‍♀️"). Include ONE
+             relevant emoji here too so it doesn't read as a dry form
+             question. This question is for engagement/logging only —
+             do not reference it as upcoming inside "message" itself.
+
+Emoji rules: keep emoji count reasonable (2-3 in "message", 1 in
+"followup_question") — enough to feel lively on WhatsApp, not so many it
+looks cluttered or unprofessional. Never use emoji in place of real
+words; they should decorate the message, not replace clarity.
 
 Example shape (values illustrative only — do not reuse this exact content):
 [
-  {{"message": "Day 1 text...", "followup_question": "Day 1 question?"}},
-  {{"message": "Day 2 text...", "followup_question": "Day 2 question?"}}
+  {{"message": "Day 1 text with emoji 💪...", "followup_question": "Day 1 question? 🎯"}},
+  {{"message": "Day 2 text with emoji 🥗...", "followup_question": "Day 2 question? ✅"}}
 ]
 """.strip()
 

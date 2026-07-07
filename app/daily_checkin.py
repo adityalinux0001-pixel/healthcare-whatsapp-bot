@@ -29,6 +29,7 @@ single entry point one job invocation should call once per day.
 import asyncio
 import logging
 from datetime import datetime
+from typing import Optional
 
 from app.config import get_settings
 from app.memory import ConversationMemory
@@ -45,10 +46,24 @@ memory = ConversationMemory(
 )
 
 
-async def _send_checkin_for_user(phone_number: str) -> None:
+async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | None" = None) -> None:
     """Send the next pregenerated, not-yet-sent plan day for one user, if
     any is due and the throttle allows it. Pure fetch-and-send — no LLM
-    call."""
+    call.
+
+    Day 1 is now sent immediately right after onboarding finishes (see
+    app/onboarding.py::_send_plan_day_now), so in practice this function
+    is only ever picking up Day 2 onward — get_next_unsent_plan_day just
+    naturally skips Day 1 since it's already marked sent.
+
+    preferred_hour_utc: if given, this user's chosen daily check-in hour
+    (0-23 UTC), collected during onboarding question 8. run_daily_checkins
+    already only calls this once per calendar day per user via
+    _run_forever's per-hour wakeups, so passing the hour through just lets
+    run_daily_checkins() decide whether THIS run's hour matches THIS
+    user's preferred hour before calling this function at all (see
+    below) — kept as a parameter here mainly for logging/clarity.
+    """
     now = datetime.utcnow()
 
     # Throttle: don't send a second check-in within
@@ -79,7 +94,8 @@ async def _send_checkin_for_user(phone_number: str) -> None:
         return
 
     day_number = plan_day["day_number"]
-    message = plan_day["message_text"]
+    header = f"*Day {day_number} of {settings.premium_plan_days}* 🗓️\n\n"
+    message = header + plan_day["message_text"]
     followup_question = plan_day.get("followup_question")
 
     try:
@@ -110,53 +126,75 @@ async def _send_checkin_for_user(phone_number: str) -> None:
             )
 
 
-async def run_daily_checkins() -> None:
+async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
     """
-    Single entry point for one day's run: fetch every user with an
-    active premium subscription and send each of them their next
-    pregenerated check-in, one at a time (sequential — this runs once a
-    day, not on the hot request path, so there's no latency pressure to
-    parallelize it).
+    Single entry point for one hour's run: fetch every user with an
+    active premium subscription, and for each one whose preferred
+    check-in hour (set during onboarding question 8 - see
+    app/onboarding.py) matches `current_hour_utc`, send their next
+    pregenerated check-in. Users who never answered a parseable time
+    already have settings.daily_checkin_hour_utc stored as their
+    effective hour (baked in by memory.set_preferred_checkin_hour at
+    onboarding time), so no extra fallback logic is needed here.
+
+    current_hour_utc: which UTC hour this run is for. Defaults to
+    "right now" so `--once` / ad-hoc invocations still work sensibly;
+    the built-in scheduler (_run_forever, below) always passes it
+    explicitly since it now wakes up once per hour instead of once per
+    day, to support per-user preferred hours.
     """
     if not settings.daily_checkin_enabled:
         logger.info("Daily check-in feature disabled (daily_checkin_enabled=False) — skipping run.")
         return
 
-    users = await asyncio.to_thread(memory.get_active_premium_users)
-    logger.info(f"📅 Daily check-in run starting — {len(users)} active premium user(s).")
+    if current_hour_utc is None:
+        current_hour_utc = datetime.utcnow().hour
 
-    for user in users:
+    users = await asyncio.to_thread(memory.get_active_premium_users)
+    due_users = [
+        u for u in users
+        if (u.get("preferred_checkin_hour_utc")
+            if u.get("preferred_checkin_hour_utc") is not None
+            else settings.daily_checkin_hour_utc) == current_hour_utc
+    ]
+    logger.info(
+        f"📅 Daily check-in run starting for hour {current_hour_utc}:00 UTC — "
+        f"{len(due_users)} of {len(users)} active premium user(s) due this hour."
+    )
+
+    for user in due_users:
         phone_number = user["phone_number"]
+        preferred_hour = user.get("preferred_checkin_hour_utc")
         try:
-            await _send_checkin_for_user(phone_number)
+            await _send_checkin_for_user(phone_number, preferred_hour_utc=preferred_hour)
         except Exception as e:
             logger.error(f"❌ Unhandled error sending check-in to {phone_number}: {e}", exc_info=True)
 
-    logger.info("📅 Daily check-in run finished.")
+    logger.info(f"📅 Daily check-in run finished for hour {current_hour_utc}:00 UTC.")
 
 
 async def _run_forever() -> None:
     """
-    Minimal built-in scheduler loop: wakes up once a minute, and once per
-    UTC calendar day (at settings.daily_checkin_hour_utc) runs the batch.
-    Intended for a small dedicated container/process
-    (`python -m app.daily_checkin`) — swap for a real cron/scheduler
-    (e.g. a cron-triggered one-off `python -m app.daily_checkin --once`)
-    if you'd rather not run a long-lived loop.
+    Scheduler loop: wakes up once a minute and, once per UTC calendar
+    hour, runs the batch for that hour. Needed now that each user can
+    have their own preferred check-in hour (see app/onboarding.py
+    question 8 and memory.set_preferred_checkin_hour) instead of
+    everyone sharing one fixed settings.daily_checkin_hour_utc.
     """
-    last_run_date = None
+    last_run_key = None
     logger.info(
-        f"Daily check-in scheduler started — will run once a day at "
-        f"{settings.daily_checkin_hour_utc}:00 UTC."
+        "Daily check-in scheduler started - checking every hour for users "
+        "whose preferred check-in hour matches."
     )
     while True:
         now = datetime.utcnow()
-        if now.hour == settings.daily_checkin_hour_utc and now.date() != last_run_date:
+        run_key = (now.date(), now.hour)
+        if run_key != last_run_key:
             try:
-                await run_daily_checkins()
+                await run_daily_checkins(current_hour_utc=now.hour)
             except Exception as e:
                 logger.error(f"❌ Daily check-in run crashed: {e}", exc_info=True)
-            last_run_date = now.date()
+            last_run_key = run_key
         await asyncio.sleep(60)
 
 

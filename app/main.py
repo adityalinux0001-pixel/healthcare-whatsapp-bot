@@ -405,6 +405,39 @@ async def generate_new_summary(phone_number: str, current_summary: str, user_msg
         logger.error(f"❌ Error updating summary for {phone_number}: {e}", exc_info=True)
 
 
+# Per-category copy for the premium upsell message. Keyed by the same
+# free-text `category` values stored on users.category / premium_plans.category
+# (see memory.py). Add an entry here whenever a new category is introduced;
+# anything not listed falls back to the generic "health" wording below.
+_PREMIUM_OFFER_COPY = {
+    "weight_loss": {
+        "hook": "Want a real shot at losing weight, not just tips you'll forget by tomorrow?",
+        "plan_name": "Fat Loss Challenge",
+        "daily_item": "one specific food, workout, or habit tweak each day, built around your weight-loss goal",
+        "adapt_line": "A plan that adapts as you lose weight — it evolves with your progress instead of staying static",
+    },
+    "bulking": {
+        "hook": "Want to actually pack on muscle instead of guessing at your macros?",
+        "plan_name": "Lean Bulk Program",
+        "daily_item": "one specific meal, lift, or recovery tip each day, built around your bulking goal",
+        "adapt_line": "A plan that adapts as you gain — it evolves with your strength and progress instead of staying static",
+    },
+    "yoga": {
+        "hook": "Want a real yoga practice that builds week over week, not random poses?",
+        "plan_name": "Yoga Progress Plan",
+        "daily_item": "one guided sequence or focus area each day, built around your practice goals",
+        "adapt_line": "A plan that adapts as your flexibility and strength improve — it evolves with your progress instead of staying static",
+    },
+}
+
+_DEFAULT_PREMIUM_OFFER_COPY = {
+    "hook": "Want real progress on your health goals, not just generic tips?",
+    "plan_name": "Premium Health Plan",
+    "daily_item": "one small suggestion or to-do each day based on your health goals",
+    "adapt_line": "A running conversation that adapts as you make progress",
+}
+
+
 async def _maybe_send_premium_offer(phone_number: str) -> None:
     """
     Runs on EVERY incoming message and decides whether to send a Razorpay
@@ -516,13 +549,16 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
             settings.premium_plan_amount_rupees * 100,
         )
 
+        category = await asyncio.to_thread(memory.get_user_category, phone_number)
+        copy = _PREMIUM_OFFER_COPY.get(category, _DEFAULT_PREMIUM_OFFER_COPY)
+
         offer_text = (
             f"Before we dive in — quick heads up 👋\n\n"
-            f"We offer a {settings.premium_plan_days}-day Premium health plan for ₹{settings.premium_plan_amount_rupees}. "
-            f"With it you get:\n"
-            f"1. A personalized daily check-in for {settings.premium_plan_days} days — one small suggestion or to-do each day based on your health goals\n"
-            f"2. Priority, more detailed answers in this chat\n"
-            f"3. A running conversation that adapts as you make progress\n\n"
+            f"{copy['hook']} "
+            f"Our {settings.premium_plan_days}-Day {copy['plan_name']} is ₹{settings.premium_plan_amount_rupees} and gives you:\n"
+            f"1. A daily action plan for {settings.premium_plan_days} days — {copy['daily_item']}\n"
+            f"2. Priority, more detailed answers whenever you're stuck or plateauing\n"
+            f"3. {copy['adapt_line']}\n\n"
             f"Totally optional — you can keep chatting normally either way. "
             f"If you'd like to grab it, here's your secure payment link:\n"
             f"{link['short_url']}"

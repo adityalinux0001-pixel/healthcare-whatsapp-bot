@@ -140,6 +140,16 @@ class ConversationMemory:
                 ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'weight_loss'
             ''')
 
+            # Migration: user's preferred hour (0-23, UTC) for daily
+            # check-ins, collected once during onboarding (see
+            # app/onboarding.py's extra "what time works for you" question).
+            # NULL means "not asked yet / use settings.daily_checkin_hour_utc
+            # default" — see app/daily_checkin.py's scheduler loop.
+            cur.execute('''
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS preferred_checkin_hour_utc INTEGER
+            ''')
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS chat_history (
                     id BIGSERIAL PRIMARY KEY,
@@ -715,15 +725,46 @@ class ConversationMemory:
     def get_active_premium_users(self) -> List[Dict]:
         """All users whose 21-day (configurable) premium subscription is
         currently active — the candidate list the scheduled daily
-        check-in job iterates over once a day."""
+        check-in job iterates over once a day. Includes
+        preferred_checkin_hour_utc (NULL if the user was never asked /
+        hasn't answered yet) so the scheduler can send each user's
+        check-in at THEIR chosen hour instead of one fixed hour for
+        everyone."""
         with self._get_conn() as conn:
             cur = conn.cursor(row_factory=dict_row)
             cur.execute('''
-                SELECT phone_number, started_at, expires_at
-                FROM subscriptions
-                WHERE expires_at > now()
+                SELECT s.phone_number, s.started_at, s.expires_at,
+                       u.preferred_checkin_hour_utc
+                FROM subscriptions s
+                LEFT JOIN users u ON u.phone_number = s.phone_number
+                WHERE s.expires_at > now()
             ''')
             return [dict(row) for row in cur.fetchall()]
+
+    def set_preferred_checkin_hour(self, phone_number: str, hour_utc: int) -> None:
+        """Store the user's chosen daily check-in hour (0-23, UTC),
+        collected once during onboarding. Upserts into `users` so it
+        works even if save_premium_plan's INSERT ... ON CONFLICT for this
+        phone_number hasn't run yet."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO users (phone_number, preferred_checkin_hour_utc)
+                VALUES (%s, %s)
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    preferred_checkin_hour_utc = EXCLUDED.preferred_checkin_hour_utc
+            ''', (phone_number, hour_utc))
+            conn.commit()
+
+    def get_preferred_checkin_hour(self, phone_number: str) -> Optional[int]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT preferred_checkin_hour_utc FROM users WHERE phone_number = %s",
+                (phone_number,),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
 
     # ------------------------------------------------------------------
     # Premium plan pregeneration (21 rows written once, sent one/day)
@@ -886,12 +927,20 @@ class ConversationMemory:
     def save_onboarding_answer(self, phone_number: str, question_key: str, answer: str) -> int:
         """Store the answer to the current question under `question_key`,
         advance question_index by 1, and return the NEW question_index
-        (i.e. which question to ask next)."""
+        (i.e. which question to ask next).
+
+        Both %s placeholders inside jsonb_build_object are explicitly
+        cast to ::text — without this, Postgres can't infer a type for
+        the first parameter ($1, the key) since jsonb_build_object is
+        variadic/polymorphic, and raises "could not determine data type
+        of parameter $1" (seen in production logs) even though the value
+        being passed is a perfectly normal string.
+        """
         with self._get_conn() as conn:
             cur = conn.cursor()
             cur.execute('''
                 UPDATE onboarding_sessions
-                SET answers = answers || jsonb_build_object(%s, %s::text),
+                SET answers = answers || jsonb_build_object(%s::text, %s::text),
                     question_index = question_index + 1,
                     updated_at = now()
                 WHERE phone_number = %s
