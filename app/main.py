@@ -572,6 +572,87 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
         logger.error(f"❌ Failed to send/save premium offer message for {phone_number}: {e}", exc_info=True)
 
 
+# Keywords that signal the user is actually engaging with health/weight-loss
+# topics, or asking about the plan/subscription itself — as opposed to a
+# bare "hii"/"hello" opener. Deliberately broad/lowercase-matched; a false
+# positive here just means the (harmless, optional) offer shows up a
+# little earlier than strictly necessary, which is fine — a false
+# negative (missing real interest) is the worse failure mode.
+_PREMIUM_INTEREST_KEYWORDS = (
+    "weight", "fat loss", "lose weight", "diet", "workout", "exercise",
+    "gym", "fitness", "calorie", "muscle", "bulk", "yoga", "plan",
+    "premium", "subscribe", "subscription", "price", "cost", "pay",
+    "payment", "buy", "checkup", "health goal", "obese", "obesity",
+)
+
+
+def _shows_premium_interest(user_text: str) -> bool:
+    """True if this message's content itself signals interest in the
+    paid plan/topic (weight loss, diet, workout, or literally asking
+    about the plan/price) — used to decide whether to show the payment
+    link right now, versus just a low-key mention (see
+    _maybe_send_greeting)."""
+    text = user_text.lower()
+    return any(keyword in text for keyword in _PREMIUM_INTEREST_KEYWORDS)
+
+
+# Very small set of common greeting openers. Only used to pick a friendly
+# greeting reply for _maybe_send_greeting below — NOT a gate on anything
+# else, so an unrecognized opener still safely falls through to the
+# normal warm intro rather than silence.
+_GREETING_WORDS = ("hi", "hii", "hiii", "hello", "hey", "heya", "yo", "namaste")
+
+
+async def _maybe_send_greeting(phone_number: str) -> bool:
+    """
+    For a message that does NOT show premium interest (see
+    _shows_premium_interest) — typically a first "hii"/"hello" — send a
+    warm, low-key intro instead of the full payment-link pitch: who the
+    bot is, plus a single soft one-liner mentioning the 21-day plan
+    exists, with NO link and NO price breakdown. The idea is to
+    introduce the paid plan only after the user has actually shown
+    interest in their health goal, rather than leading with a sales
+    pitch on "hii".
+
+    Skipped entirely for users with an active premium subscription (they
+    don't need to be told the plan exists), and only sent on this user's
+    FIRST-EVER message (message_count == 0 before this turn's save) so a
+    chatty user doesn't get the same "by the way" intro repeated on
+    every plain "hii"/"hello" they happen to send later.
+
+    Returns True if the greeting was actually sent (caller should treat
+    this as the full reply for the turn and stop — see call site in
+    _handle_incoming), False if skipped for any reason (caller should
+    fall through to normal Q&A handling instead).
+    """
+    try:
+        if await asyncio.to_thread(memory.is_premium_active, phone_number):
+            return False
+
+        message_count = await asyncio.to_thread(memory.get_message_count, phone_number)
+        if message_count > 0:
+            # Not this user's first message — they've already seen either
+            # this greeting or other bot replies before; don't repeat it.
+            return False
+
+        greeting_text = (
+            "Hi! 👋 I'm your AI health assistant — happy to help with diet, "
+            "workouts, or any health questions you've got.\n\n"
+            "By the way, if you're working on a weight-loss (or other health) "
+            "goal, I also run a 21-day guided plan with daily check-ins — "
+            "just tell me a bit about your goal if you'd like to hear more 🙂"
+        )
+        await send_text_message(phone_number, greeting_text)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", greeting_text, message_type="text"
+        )
+        logger.info(f"👋 Sent low-key greeting/intro to {phone_number}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to send greeting for {phone_number}: {e}", exc_info=True)
+        return False
+
+
 async def maybe_send_followup(
     phone_number: str,
     customer_summary: str,
@@ -843,17 +924,37 @@ async def _handle_incoming(raw_msg: dict) -> None:
     # it doesn't look like the message went nowhere during that wait.
     background_tasks.append(asyncio.create_task(mark_as_read(msg.id, show_typing=True)))
 
-    # ============ PREMIUM UPSELL: fire on the first message of a new session ============
-    # Awaited (not fire-and-forget) and placed BEFORE any save_message()/
-    # append_turn() call for this turn — those overwrite last_message_at
-    # with "now", so reading it after saving (or racing a background task
-    # against the save) would always look like 0 seconds have passed.
-    await _maybe_send_premium_offer(sender)
-
     # ============ TEXT MESSAGE ============
     if msg.type == "text" and msg.text:
         user_text = msg.text.body.strip()
         logger.info(f"👤 [{sender}]: {user_text}")
+
+        # ============ PREMIUM UPSELL: only when the message itself shows
+        # interest (weight-loss/health-goal talk, or explicitly asking
+        # about the plan/subscription) — NOT on every generic "hii"/
+        # "hello" opener. A brand new user who just says hi gets a warm,
+        # low-key intro instead (see _maybe_send_greeting below); the
+        # payment-link pitch only fires once they've actually engaged
+        # with the topic. Awaited (not fire-and-forget) and placed before
+        # any save_message()/append_turn() call for this turn — those
+        # overwrite last_message_at with "now", so reading it after
+        # saving would always look like 0 seconds have passed. ============
+        if _shows_premium_interest(user_text):
+            await _maybe_send_premium_offer(sender)
+        else:
+            greeted = await _maybe_send_greeting(sender)
+            if greeted:
+                # This was the user's very first message and it was just
+                # a plain greeting ("hii"/"hello") with no health content
+                # to actually respond to — the intro above IS the reply
+                # for this turn. Save it as the user's turn and stop here
+                # so the normal LLM Q&A path doesn't also send its own
+                # generic "Hi there! How can I help you today?" on top of
+                # it (that duplication was the actual bug being fixed).
+                await asyncio.to_thread(
+                    memory.save_message, sender, "user", user_text, message_type="text"
+                )
+                return
 
         # ---- ONBOARDING IN PROGRESS: route straight into the question flow ----
         # Must run before any other text handling (commands, follow-up
