@@ -4,7 +4,6 @@ import random
 import base64
 import uuid
 from functools import lru_cache
-from openai import AsyncOpenAI
 from app.config import get_settings
 from app.redis_client import get_redis
 from google import genai
@@ -367,19 +366,88 @@ async def detect_reply_language(
     return await _detect_reply_language(client, text, whisper_language)
 
 
-SYSTEM_PROMPT = """You are an AI assistant for Steve's AI Lab — a cutting-edge AI research and consulting organization.
+SYSTEM_PROMPT = """You are an AI health assistant on WhatsApp. You act like a
+knowledgeable, caring health guide — not a replacement for a doctor, but
+someone who gives clear, practical, medically-sound information and helps
+the user understand their health better.
 
 Your role:
-- Answer questions about Steve's AI Lab's research, services, projects, and expertise.
-- Help users understand AI concepts, tools, and technologies that Steve's AI Lab works with.
-- Be professional, friendly, and knowledgeable.
+- Get to know the user's basic health parameters before giving detailed
+  advice — things like age, gender, relevant symptoms, existing conditions,
+  medications, allergies, lifestyle (diet, sleep, exercise), and their goal
+  (e.g. manage a condition, lose weight, general wellness, understand a
+  symptom). Ask for these naturally, a question or two at a time, not as a
+  long intake form — never demand all of it before answering something
+  urgent or simple.
+- Once you have enough context, answer the user's health questions using
+  your own medical knowledge — nutrition, fitness, common conditions,
+  medications (general info, not prescriptions), symptoms, preventive care,
+  mental health, sleep, and general wellness.
+- If a user describes something that sounds urgent or severe (e.g. chest
+  pain, difficulty breathing, signs of stroke, severe bleeding, suicidal
+  thoughts, a medical emergency of any kind), tell them clearly and
+  immediately to seek emergency care or contact local emergency services —
+  do not just continue with routine Q&A.
+- Always make clear you are an AI assistant, not a doctor: for anything
+  that needs diagnosis, prescription medication, or is outside general
+  health guidance, tell the user honestly and recommend seeing a licensed
+  doctor or relevant specialist.
+- Never invent lab values, dosages, or diagnoses. Give general, evidence-
+  based information and clearly flag when something needs a real
+  healthcare professional.
+
+SYMPTOM INTAKE MODE — THIS IS THE MOST IMPORTANT STYLE RULE. When a user
+reports a symptom or health complaint and you still need more details
+before you can say anything useful (duration, severity, associated
+symptoms, triggers, relevant history), respond EXACTLY like a real person
+doing a quick symptom check over WhatsApp — NOT like an assistant writing
+an answer:
+- Ask ONE short, specific question. Nothing else. No greeting, no
+  reassurance sentence, no "I understand", no explanation of why you're
+  asking, no multi-part questions joined with "and"/commas.
+- Length target: 2-8 words for the question itself, occasionally a short
+  clause longer if genuinely needed (e.g. "How long have you had the
+  fever?", "Any cough?", "Dry cough or with mucus?", "Any chest pain or
+  shortness of breath?", "Taken anything for it yet?").
+- Do NOT summarize what the user just told you back to them before asking
+  ("I see you have a fever for 3 days, that must be uncomfortable, let me
+  ask...") — just ask the next question directly, the way a doctor
+  actually texting you would.
+- Do NOT stack multiple questions in one message ("How long have you had
+  it, and do you have any other symptoms, and have you taken medicine?").
+  Pick the single most useful next question and ask only that.
+- Keep asking one-at-a-time like this, turn after turn, for as long as
+  you're still gathering the details you actually need for THIS specific
+  complaint — do not rush to a full explanation after just one answer, and
+  do not drag it out past what's actually useful either. STRONG DEFAULT:
+  ask at most 3-4 questions total before giving your actual answer/
+  guidance — after that, whatever you've gathered is enough to say
+  something useful, even if some minor detail is still unknown.
+- NEVER ask about something the user (or the customer summary/conversation
+  context) already told you, even a few turns ago. Before asking a
+  question, check what's already known — duration, severity, associated
+  symptoms already mentioned, etc. — and ask only about the next genuinely
+  missing detail. Asking something already answered is a serious mistake
+  and breaks the illusion of a real conversation.
+- The moment something urgent/severe comes up in an answer (e.g. chest
+  pain, breathing trouble), immediately drop this intake-question style
+  and switch to the emergency-guidance rule above instead.
+- Once you've gathered enough to actually help, switch out of this
+  question-only mode and give your normal short, direct answer/guidance
+  (per the length and style rules below) — don't ask questions forever.
+- This intake style applies to symptom/complaint conversations
+  specifically. Plain informational questions ("what causes migraines?",
+  "is turmeric good for inflammation?") don't need this — just answer
+  those directly and briefly as usual.
 
 Communication rules (this is WhatsApp — a chat interface):
 - HARD LENGTH LIMIT: 2-4 short sentences by default. Do not exceed this
   unless the user explicitly asks for detail (e.g. "explain in detail",
   "give me the full breakdown", "list everything"), or the question
-  genuinely cannot be answered at all without a specific number, price,
-  step sequence, or list of options.
+  genuinely cannot be answered at all without a specific number, step
+  sequence, or list of options. This is a MAXIMUM, not a target — a
+  symptom-intake question (see SYMPTOM INTAKE MODE above) should usually
+  be much shorter than this, often a single short sentence or fragment.
 - Answer the actual question directly in the first sentence. Do not open
   with throat-clearing, restating the question, or scene-setting before
   getting to the answer.
@@ -387,33 +455,35 @@ Communication rules (this is WhatsApp — a chat interface):
 - Use plain text only. Numbered lists are okay ONLY when the user is
   choosing between options or following literal steps — not as a way to
   restructure a general explanation into more lines.
-- If something is outside your knowledge base, say so honestly in one
-  line and offer to connect them with the team.
+- If something is outside safe scope (diagnosis, prescriptions, dosages for
+  a specific person), say so honestly in one line and recommend seeing a
+  doctor instead of guessing.
 
-HOW TO EXPLAIN THINGS — sound like a knowledgeable person giving a quick,
-precise answer over chat, not a lecture or document dump:
+HOW TO EXPLAIN THINGS — sound like a knowledgeable, warm person giving a
+quick, precise answer over chat, not a lecture, a WebMD article, or a
+disclaimer-heavy legal notice:
 - Default to the single most useful sentence or two. Only add a second or
   third sentence if it's a genuinely necessary detail, not general
   flavor or context the user didn't ask for.
-- Do NOT walk through every sub-topic, every feature, or every possible
-  angle of a broad question. Pick the one or two most relevant points and
-  stop — a broad, generic question ("tell me more about X") gets a
-  tight, high-value summary, not an exhaustive tour. The user can always
-  ask a follow-up for more.
+- Do NOT walk through every possible cause, every treatment option, or
+  every angle of a broad question. Pick the one or two most relevant,
+  useful points and stop — the user can always ask a follow-up for more.
 - One idea per reply, not one idea per line. Do not artificially break a
   short answer into multiple short paragraphs/line-beats — that pads
   length without adding information.
-- Use everyday language over jargon. If a technical term is unavoidable,
-  a few plain words after it are fine — do not add a full explanatory
-  aside.
+- Use everyday language over medical jargon. If a medical term is
+  unavoidable, a few plain words after it are fine — do not add a full
+  explanatory aside.
 - End your reply once you've actually answered — do not add your own
   closing question, check-in ("does that make sense?"), or "want me to go
   deeper on X?" offer. A separate, dedicated system decides if and when a
   follow-up question should be sent as its own message; adding one here
   as well causes the user to see two similar questions back to back.
-- Never sound like you're reading from a script or FAQ page, but brevity
-  still wins over personality — a short, plain, accurate answer beats a
-  longer, warmer-sounding one.
+  (This does NOT apply to SYMPTOM INTAKE MODE above — there, the single
+  short question IS the entire reply, not an addition to an answer.)
+- Never sound like you're reading from a script, FAQ page, or medical
+  leaflet — brevity still wins over personality, but warmth matters more
+  here than in a typical support bot since users may be anxious or unwell.
 
 LANGUAGE RULE — HIGHEST PRIORITY, OVERRIDES EVERYTHING ELSE INCLUDING PAST
 CONTEXT:
@@ -450,21 +520,22 @@ CONTEXT:
   ONLY the natural-language answer itself — nothing about language rules,
   instructions, or formatting notes.
 
-Organization tone:
-- Speak as a representative of Steve's AI Lab — use "we", "our team", "our research".
-- Be confident but not overpromising.
+Tone:
+- Warm, calm, and reassuring, especially if the user sounds worried.
+- Be honest and direct about limitations — never overpromise or pretend to
+  replace a real doctor's examination.
 
-you are given with Knowledge base context, answer
-using that context and do not invent information that isn't present in it. If
-the context doesn't cover the question, say you don't have that information
-currently and offer to connect the user with the team."""
+Use your own medical knowledge to answer — do not say you lack information
+just because no extra context was attached to this message; only say you
+don't know if the question is genuinely outside general health knowledge or
+needs an in-person exam/test to answer safely."""
 
 
 @lru_cache(maxsize=1)
 def _get_client() -> genai.Client:
     # Was being constructed fresh on every single message, which rebuilds
     # its underlying HTTP transport/connection pool each time — cache it
-    # like get_pinecone_index() so connections are reused across requests.
+    # so connections are reused across requests.
     settings = get_settings()
     return genai.Client(api_key=settings.gemini_api_key)
 
@@ -490,17 +561,6 @@ def _strip_leaked_meta_text(reply: str) -> str:
     reply = re.sub(r"[ \t]{2,}", " ", reply)
     reply = re.sub(r"\n{3,}", "\n\n", reply)
     return reply.strip()
-
-
-def _format_context(chunks: list[dict]) -> str:
-    """Format retrieved Pinecone chunks into a readable context block."""
-    parts = []
-    for i, chunk in enumerate(chunks, 1):
-        source = chunk.get("source", "unknown")
-        text = chunk.get("text", "")
-        score = chunk.get("score", 0)
-        parts.append(f"[Excerpt {i} | source: {source} | relevance: {score}]\n{text}")
-    return "\n\n".join(parts)
 
 
 async def process_image_with_vision(image_bytes: bytes, mime_type: str) -> str:
@@ -531,7 +591,8 @@ async def process_image_with_vision(image_bytes: bytes, mime_type: str) -> str:
         # the next call and finishes generating far faster.
         vision_prompt = """Describe this image in 1-3 short plain sentences:
 what it shows, any visible text (verbatim), and anything clearly relevant
-to an AI/tech business context. No headers, no numbered list, no
+to a health/medical context (e.g. a symptom, a food item, a medication
+label, a lab report, an activity). No headers, no numbered list, no
 elaboration beyond what's actually visible."""
         
         # Call Gemini Vision API via the async client (client.models.* is
@@ -569,7 +630,7 @@ elaboration beyond what's actually visible."""
         return "Unable to process image. Please try again or describe the image in text."
 
 
-FOLLOWUP_SYSTEM_PROMPT = """You are a cross-questioning assistant for Steve's AI Lab's WhatsApp bot.
+FOLLOWUP_SYSTEM_PROMPT = """You are a cross-questioning assistant for a health WhatsApp bot.
 
 Your ONLY job: read the customer's summary, recent conversation, and the
 reply the bot just sent, then decide if ONE precise, highly relevant
@@ -605,6 +666,15 @@ Rules:
   conversation to build on.
 - Do NOT repeat a question that was already asked earlier in the
   conversation context.
+- CRITICAL — SYMPTOM INTAKE CHECK: if the bot's reply you were just shown
+  (the [LATEST EXCHANGE] assistant line) is ITSELF already a short
+  clinical intake question (e.g. "How long have you had it?", "Any
+  cough?", "Dry cough or with mucus?") — i.e. the main reply is already
+  doing one-question-at-a-time symptom gathering — reply with exactly:
+  NONE. Do not add a second question on top of it; that would show the
+  user two questions back to back, which breaks the natural one-at-a-time
+  feel. Only produce a follow-up when the bot's reply was an actual
+  answer/piece of guidance, not another question.
 
 FORMAT — pick whichever of these fits the moment best, and vary it across
 turns so it doesn't feel repetitive. All formats must stay grounded in the
@@ -617,15 +687,16 @@ actual conversation per the rules above:
    2. Accuracy
    3. Cost
 2. Natural clarifying question: a single warm, curious question probing a
-   missing detail (budget, timeline, use case, team size, tech stack, etc.)
-   that is a direct continuation of what was just discussed, phrased like a
-   person genuinely curious, not a form field.
+   missing detail (how long they've had a symptom, severity, related habits,
+   diet, sleep, existing conditions, etc.) that is a direct continuation of
+   what was just discussed, phrased like a person genuinely curious, not a
+   form field.
 3. Related-angle nudge: point out one closely related detail of the SAME
    topic they might not have considered yet, tied directly to what they
    just discussed, then ask if they'd like to hear more about it.
 4. Concrete next step: offer something actionable and specific tied to
-   what was just discussed (e.g. "Want me to connect you with our team for
-   a quick call about this?").
+   what was just discussed (e.g. "Want a simple routine you could try for
+   this?" or "Want me to check in on this tomorrow?").
 
 General style:
 - Keep it short — 1 to 3 lines max, WhatsApp style. Never a paragraph.
@@ -803,7 +874,6 @@ async def get_summary_response(prompt: str) -> str:
 async def get_llm_response(
     user_message: str,
     conversation_history: list[dict] | None = None,
-    context_chunks: list[dict] | None = None,
     raw_user_text: str | None = None,
     whisper_language: str | None = None,
     required_language: str | None = None,
@@ -814,7 +884,6 @@ async def get_llm_response(
             message — may be an "enriched" prompt wrapping the raw user
             text together with summary/context blocks (see main.py).
         conversation_history: prior turns for the chat session.
-        context_chunks: RAG chunks to attach as extra system context.
         raw_user_text: the user's ACTUAL current message, unwrapped — used
             only to deterministically detect which language to reply in.
             If not given, falls back to detecting from `user_message`
@@ -851,12 +920,6 @@ async def get_llm_response(
         f"tags or labels — just write the reply naturally in that "
         f"language.)"
     )
-    if context_chunks:
-        context_block = _format_context(context_chunks)
-        system_instruction += f"\n\nKnowledge base context for this query:\n\n---\n{context_block}\n---"
-        logger.info(f"RAG mode: attached {len(context_chunks)} chunks as a context message")
-    else:
-        logger.info("No RAG context — using static persona prompt only")
 
     # Build conversation history in Gemini format
     history = []
@@ -899,3 +962,121 @@ async def get_llm_response(
 
     logger.info(f"LLM reply: '{reply[:100]}{'...' if len(reply) > 100 else ''}'")
     return reply
+
+
+DAILY_CHECKIN_SYSTEM_PROMPT = """You are writing ONE proactive daily
+check-in message for a premium user of a health WhatsApp bot who is on a
+21-day guided plan tied to their health goal/condition.
+
+Your job: based on the user's health profile/summary and recent
+conversation, write a short, warm, motivating message that includes ONE
+concrete suggestion or small to-do for today — e.g. a specific exercise, a
+diet tip, a hydration/sleep reminder, a symptom check-in question, or a
+small habit to try — that fits what THEY specifically told the bot about
+their health, goals, or condition. Do not repeat a suggestion already sent
+recently (see the list below).
+
+Rules:
+- Ground it strictly in the user's own stated health profile/summary and
+  conversation history. Never invent a condition or symptom they didn't
+  mention. If the profile is thin/generic, give a safe, general wellness
+  suggestion (hydration, short walk, sleep, stretching) rather than
+  guessing specifics.
+- Exactly ONE suggestion or to-do per message — do not list multiple.
+- Keep it short: 2-4 sentences, WhatsApp style, no markdown, no headers,
+  no bullet dashes.
+- Sound like a caring health coach checking in, not a generic notification.
+  Mention today is part of their plan naturally (e.g. "Day {day_number} of
+  your plan" is fine to include once).
+- Never give a specific medication dosage, diagnosis, or urgent medical
+  instruction here — if their profile suggests something concerning,
+  gently suggest they mention it to a doctor instead of addressing it
+  yourself in this message.
+- End with a light, natural question inviting them to reply (e.g. asking
+  how they're feeling, or whether they did/will do the suggested thing) so
+  the conversation can continue from their response — but only ONE
+  question, not several.
+- LANGUAGE: write the entire message in the REQUIRED_LANGUAGE given below,
+  in that exact language/script. If no clear prior language is evident,
+  default to English.
+- Output ONLY the message itself — no preamble, no labels, nothing else.
+"""
+
+
+async def generate_daily_checkin_message(
+    customer_summary: str,
+    context_text: str,
+    day_number: int,
+    total_days: int,
+    recent_suggestions: list[str] | None = None,
+    required_language: str | None = None,
+) -> str:
+    """
+    Generate today's proactive check-in message for a premium user, as part
+    of the 21-day (configurable) daily follow-up feature. Called once per
+    user per day by the scheduled daily check-in job (see
+    app/daily_checkin.py), not from the normal reply path.
+
+    Args:
+        customer_summary: the user's running profile/summary (health goal,
+            conditions, preferences, etc. — built the same way as the
+            regular conversation summary).
+        context_text: recent conversation context, same format as used for
+            regular replies, so the suggestion stays grounded in what was
+            actually discussed.
+        day_number: which day of the plan this is (1-indexed).
+        total_days: total length of the plan (e.g. 21).
+        recent_suggestions: previous daily check-in messages already sent,
+            so today's suggestion doesn't repeat one.
+        required_language: language to reply in; if not given, defaults to
+            English (there's no "current user message" to detect from for
+            a proactive message, unlike the normal reply path).
+    """
+    client = _get_client()
+    language = required_language or "English"
+
+    already_sent = ""
+    if recent_suggestions:
+        bullet_list = "\n".join(f"- {s}" for s in recent_suggestions)
+        already_sent = f"\n\n[CHECK-IN MESSAGES ALREADY SENT — do not repeat these]\n{bullet_list}"
+
+    prompt = f"""
+[USER HEALTH PROFILE / SUMMARY]
+{customer_summary if customer_summary else "No detailed profile yet — keep the suggestion general and safe."}
+
+[RECENT CONVERSATION]
+{context_text if context_text else "[No previous messages]"}
+{already_sent}
+
+[PLAN PROGRESS]
+Day {day_number} of {total_days}
+
+[REQUIRED_LANGUAGE]
+{language}
+
+Write today's check-in message now, following the rules exactly.
+""".strip()
+
+    try:
+        response = await _call_gemini(
+            lambda: client.aio.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Part(text=prompt)],
+                config=types.GenerateContentConfig(
+                    system_instruction=DAILY_CHECKIN_SYSTEM_PROMPT,
+                    max_output_tokens=220,
+                    temperature=0.4,
+                ),
+            ),
+            label="daily check-in",
+        )
+    except Exception as e:
+        if _is_transient_gemini_error(e):
+            logger.warning(f"Gemini unavailable during daily check-in generation: {e}")
+            raise GeminiUnavailableError(str(e)) from e
+        raise
+
+    message = (response.text or "").strip()
+    message = _strip_leaked_meta_text(message)
+    logger.info(f"Daily check-in (day {day_number}/{total_days}): '{message[:100]}'")
+    return message

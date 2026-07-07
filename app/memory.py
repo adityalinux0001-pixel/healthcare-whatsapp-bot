@@ -207,6 +207,43 @@ class ConversationMemory:
                 ADD COLUMN IF NOT EXISTS expiry_notified BOOLEAN NOT NULL DEFAULT FALSE
             ''')
 
+            # Tracks the daily premium check-in messages sent as part of
+            # the 21-day (configurable) plan — one row per day actually
+            # sent, so the scheduled job knows which day number a user is
+            # on and never double-sends for the same calendar day.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS daily_checkins (
+                    id BIGSERIAL PRIMARY KEY,
+                    phone_number TEXT NOT NULL,
+                    day_number INTEGER NOT NULL,
+                    message TEXT NOT NULL,
+                    sent_at TIMESTAMPTZ DEFAULT now()
+                )
+            ''')
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_daily_checkins_phone
+                ON daily_checkins(phone_number, sent_at DESC)
+            ''')
+
+            # Tracks the CURRENT symptom-intake conversation for a user —
+            # how many short intake questions have been asked so far for
+            # whatever complaint is being discussed right now. This is
+            # deterministic, code-level state: we do NOT trust the LLM to
+            # count/remember how many questions it has already asked, since
+            # that proved unreliable in practice (it kept looping /
+            # repeating questions instead of concluding). One row per
+            # phone_number; reset (question_count -> 0, started fresh)
+            # whenever a new symptom/complaint is detected, or after the
+            # intake session naturally times out.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS symptom_sessions (
+                    phone_number TEXT PRIMARY KEY,
+                    question_count INTEGER NOT NULL DEFAULT 0,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            ''')
+
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -544,3 +581,132 @@ class ConversationMemory:
                 WHERE phone_number = %s
             ''', (phone_number,))
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Daily premium check-ins (21-day plan)
+    # ------------------------------------------------------------------
+
+    def get_checkins_sent_count(self, phone_number: str, since: datetime) -> int:
+        """How many daily check-ins have already been sent for this user
+        since `since` (normally the subscription's started_at) — used to
+        compute which day number of the plan today is."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT COUNT(*) FROM daily_checkins
+                WHERE phone_number = %s AND sent_at >= %s
+            ''', (phone_number, since))
+            return cur.fetchone()[0]
+
+    def get_last_checkin_sent_at(self, phone_number: str) -> Optional[datetime]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT sent_at FROM daily_checkins
+                WHERE phone_number = %s
+                ORDER BY sent_at DESC
+                LIMIT 1
+            ''', (phone_number,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def get_recent_checkin_messages(self, phone_number: str, limit: int = 5) -> List[str]:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT message FROM daily_checkins
+                WHERE phone_number = %s
+                ORDER BY sent_at DESC
+                LIMIT %s
+            ''', (phone_number, limit))
+            return [row[0] for row in cur.fetchall()]
+
+    def save_daily_checkin(self, phone_number: str, day_number: int, message: str) -> None:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO daily_checkins (phone_number, day_number, message)
+                VALUES (%s, %s, %s)
+            ''', (phone_number, day_number, message))
+            conn.commit()
+
+    def get_active_premium_users(self) -> List[Dict]:
+        """All users whose 21-day (configurable) premium subscription is
+        currently active — the candidate list the scheduled daily
+        check-in job iterates over once a day."""
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute('''
+                SELECT phone_number, started_at, expires_at
+                FROM subscriptions
+                WHERE expires_at > now()
+            ''')
+            return [dict(row) for row in cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Symptom intake session (deterministic question-count cap)
+    # ------------------------------------------------------------------
+
+    def get_symptom_question_count(self, phone_number: str) -> int:
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT question_count FROM symptom_sessions WHERE phone_number = %s",
+                (phone_number,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+    def increment_symptom_question_count(self, phone_number: str) -> int:
+        """Increment (creating the row if needed) and return the new
+        count. Called once every time the bot sends an intake-style
+        question, so the count always reflects reality regardless of what
+        the LLM itself thinks it has asked."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO symptom_sessions (phone_number, question_count, started_at, updated_at)
+                VALUES (%s, 1, now(), now())
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    question_count = symptom_sessions.question_count + 1,
+                    updated_at = now()
+                RETURNING question_count
+            ''', (phone_number,))
+            new_count = cur.fetchone()[0]
+            conn.commit()
+            return new_count
+
+    def reset_symptom_session(self, phone_number: str) -> None:
+        """Reset the intake question counter back to 0 — called once the
+        bot has actually given its answer/guidance (intake finished), so
+        the NEXT new complaint starts counting from zero again."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO symptom_sessions (phone_number, question_count, started_at, updated_at)
+                VALUES (%s, 0, now(), now())
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    question_count = 0,
+                    started_at = now(),
+                    updated_at = now()
+            ''', (phone_number,))
+            conn.commit()
+
+    def get_symptom_session_age_seconds(self, phone_number: str) -> Optional[float]:
+        """How long ago the current intake session started — used to
+        auto-expire a stale session (e.g. user went quiet for hours then
+        came back with something unrelated) so the counter doesn't
+        artificially cap an unrelated, brand-new conversation."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT started_at FROM symptom_sessions WHERE phone_number = %s",
+                (phone_number,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            started_at = row[0]
+            if started_at.tzinfo is not None:
+                started_at = started_at.replace(tzinfo=None)
+            return (datetime.utcnow() - started_at).total_seconds()

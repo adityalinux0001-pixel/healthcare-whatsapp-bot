@@ -25,6 +25,7 @@ RESULT_TTL = 0
 
 _celery_app: Any = None
 _huey: Any = None
+_huey_process_incoming_task: Any = None  # cached @_huey.task-wrapped function
 
 
 def _get_settings():
@@ -71,7 +72,7 @@ def get_celery_app() -> Any:
 
 
 def get_huey() -> Any:
-    global _huey
+    global _huey, _huey_process_incoming_task
     settings = _get_settings()
     if RedisHuey is None:
         raise RuntimeError("Huey is not installed")
@@ -83,6 +84,11 @@ def get_huey() -> Any:
     @_huey.task(name="app.queueing.process_incoming_huey")
     def process_incoming_huey(message: dict) -> None:
         _run_handle(message)
+
+    # process_incoming_huey only exists in this local scope — cache it at
+    # module level so _enqueue_huey (called after get_huey() elsewhere) can
+    # actually reach it instead of hitting an undefined-name error.
+    _huey_process_incoming_task = process_incoming_huey
 
     return _huey
 
@@ -112,9 +118,53 @@ def _enqueue_celery(raw_msg: dict) -> str:
 
 
 def _enqueue_huey(raw_msg: dict) -> str:
-    huey = get_huey()
-    task = huey.enqueue(process_incoming_huey, raw_msg)
+    get_huey()  # ensures _huey_process_incoming_task is populated
+    task = _huey_process_incoming_task.enqueue(raw_msg)
     return str(task.id)
+
+
+def _to_plain_dict(raw_msg: Any) -> dict:
+    """Normalize raw_msg to a plain JSON-serializable dict.
+
+    raw_msg is a WebhookMessage Pydantic model (see app/models.py) when it
+    comes straight from the webhook handler's `value.messages` list — NOT
+    a dict. RQ/Celery/Huey never hit this problem because they pickle
+    arguments (which works fine on Pydantic objects), but Kafka publishing
+    goes through json.dumps(), which cannot serialize a Pydantic model
+    directly. model_dump(by_alias=True) converts it to a dict using the
+    original WhatsApp field names (e.g. "from" instead of "from_"), which
+    is exactly what IncomingMessage.from_raw() expects on the consumer
+    side (see app/models.py's from_raw, which does the same conversion).
+    """
+    if isinstance(raw_msg, dict):
+        return raw_msg
+    if hasattr(raw_msg, "model_dump"):
+        return raw_msg.model_dump(by_alias=True)
+    raise TypeError(f"Cannot convert {type(raw_msg)!r} to dict for Kafka publish")
+
+
+def _extract_phone_number(raw_msg: dict) -> str:
+    """Best-effort phone number extraction for Kafka partition keying.
+
+    Expects a plain dict (see _to_plain_dict) — falls back to 'unknown'
+    (all such messages share one partition) rather than raising, so a
+    malformed message still gets queued and the normal handler/idempotency
+    logic can reject it, instead of it being lost before it ever reaches
+    Kafka.
+    """
+    return str(raw_msg.get("from") or raw_msg.get("sender") or "unknown")
+
+
+def _enqueue_kafka(raw_msg: Any) -> str:
+    from app.kafka_client import publish
+
+    settings = _get_settings()
+    raw_msg_dict = _to_plain_dict(raw_msg)
+    phone_number = _extract_phone_number(raw_msg_dict)
+    publish(settings.kafka_inbound_topic, key=phone_number, value=raw_msg_dict)
+    # Kafka doesn't hand back a job id the way RQ/Celery do — the
+    # (topic, key) pair is the closest analogue and is useful in logs.
+    return f"{settings.kafka_inbound_topic}:{phone_number}"
 
 
 def enqueue_incoming(raw_msg: dict) -> str:
@@ -126,6 +176,8 @@ def enqueue_incoming(raw_msg: dict) -> str:
         return _enqueue_celery(raw_msg)
     if backend == "huey":
         return _enqueue_huey(raw_msg)
+    if backend == "kafka":
+        return _enqueue_kafka(raw_msg)
 
     raise ValueError(f"Unsupported queue backend: {settings.queue_backend}")
 

@@ -16,7 +16,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException, Query, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from app.config import get_settings
 from app.models import (
@@ -24,9 +24,6 @@ from app.models import (
     IncomingMessage,
     TestMessageRequest,
     TestTemplateRequest,
-    TestRAGRequest,
-    IngestTextRequest,
-    DeleteSourceRequest,
 )
 from app.whatsapp import (
     send_text_message,
@@ -43,8 +40,6 @@ from app.llm import (
     is_gemini_busy,
     GeminiUnavailableError,
 )
-from app.vector_utils import retrieve_context, get_pinecone_index, get_index_stats
-from app.ingest import ingest_text, delete_source, read_file
 from app.memory import ConversationMemory
 from app.idempotency import try_mark_message_processed
 from app.audio_handler import (
@@ -88,19 +83,12 @@ _MAX_MESSAGE_AGE_SECONDS = 120
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=" * 60)
-    logger.info("Steve's AI Lab — WhatsApp RAG Bot (ENHANCED)")
+    logger.info("AI Health Assistant — WhatsApp Bot")
     logger.info(f"Phone Number ID : {settings.phone_number_id}")
-    logger.info(f"Pinecone Index  : {settings.pinecone_index_name}")
-    logger.info(f"RAG top-k       : {settings.rag_top_k}")
     logger.info(f"Database        : {memory._safe_url()}")
     logger.info(f"Audio Storage   : {memory.audio_dir}")
     logger.info("Swagger UI      : http://localhost:8000/docs")
     logger.info("=" * 60)
-    try:
-        get_pinecone_index()
-        logger.info("✅ Pinecone connected")
-    except Exception as e:
-        logger.error(f"❌ Pinecone connection failed: {e}")
 
     try:
         from app.redis_client import get_redis
@@ -122,7 +110,7 @@ async def lifespan(app: FastAPI):
         logger.warning("Error closing Postgres pool on shutdown", exc_info=True)
 
 
-app = FastAPI(title="Steve's AI Lab — WhatsApp RAG Bot (ENHANCED)")
+app = FastAPI(title="AI Health Assistant — WhatsApp Bot")
 
 
 # Webhook GET — Meta verification
@@ -176,6 +164,42 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
         raise
 
 
+def _looks_like_a_question(reply: str) -> bool:
+    """
+    Deterministic, code-level check for "is this reply already a short
+    intake-style question?" — used both to (a) hard-skip the follow-up
+    system so it never adds a second question on top of one the main
+    reply already asked, and (b) drive the symptom-intake question
+    counter in generate_context_aware_response(). Relying on an LLM call
+    to self-report "was my last reply a question" was unreliable in
+    practice and caused duplicate/looping questions in symptom-intake
+    conversations — this is a simple, deterministic text check instead.
+
+    Heuristic: short (intake questions are always brief per the system
+    prompt) AND ends with a question mark. A longer reply ending in "?"
+    (e.g. a full explanation that happens to end with a rhetorical
+    question) is intentionally NOT caught by this — it only targets the
+    short, single-question intake style.
+    """
+    text = reply.strip()
+    if not text:
+        return False
+
+    # Consider only the first line for the length/"is this a question"
+    # check — poll-style numbered options (e.g. "1. Around 100°F") may
+    # follow on later lines and shouldn't affect this.
+    first_line = text.splitlines()[0].strip()
+
+    if not first_line.endswith("?"):
+        return False
+
+    # Intake questions are short by design (system prompt: 2-8 words,
+    # occasionally a short clause more). Generous upper bound in
+    # characters to stay robust across languages/scripts without needing
+    # word-splitting logic.
+    return len(first_line) <= 120
+
+
 async def generate_context_aware_response(
     phone_number: str,
     user_message: str,
@@ -201,48 +225,67 @@ async def generate_context_aware_response(
         generate_followup_suggestion() instead of having that function
         re-detect the same deterministic result via a second Gemini call.
     """
-    # Run local DB lookups, the (slower) RAG retrieval, AND language
-    # detection all concurrently — they're all independent of each other,
-    # so no need to do any of them sequentially.
+    # Run local DB lookups AND language detection concurrently — they're
+    # independent of each other, so no need to do either sequentially.
     #
-    # LATENCY FIX: detect_reply_language() used to be awaited on its own,
-    # AFTER this gather() had already finished — meaning every turn paid
-    # for two full sequential Gemini round-trips (detect language, THEN
-    # generate the main reply) even though detection doesn't depend on
-    # anything this gather produces. Folding it into the same gather()
-    # means its latency overlaps with the RAG/DB round-trips instead of
-    # stacking on top of them, and the main Gemini reply call is now the
-    # only Gemini call still purely sequential on the critical path.
-    #
-    # NOTE: memory.* methods use blocking sqlite3 calls. Without
+    # NOTE: memory.* methods use blocking psycopg calls. Without
     # asyncio.to_thread here, calling them directly inside these
     # coroutines would run synchronously on the event loop, defeating the
     # whole point of asyncio.gather — they'd effectively execute one after
     # another (and block every other in-flight request) instead of really
-    # running concurrently with the RAG retrieval.
+    # running concurrently with language detection.
     async def _get_context():
         return await asyncio.to_thread(memory.get_conversation_context, phone_number, limit=5)
 
     async def _get_customer():
         return await asyncio.to_thread(memory.get_customer, phone_number)
 
-    async def _get_chunks():
-        try:
-            return await retrieve_context(user_message, top_k=settings.rag_top_k)
-        except Exception as e:
-            logger.error(f"RAG retrieval error: {e}")
-            return []
-
     async def _get_language():
         return await detect_reply_language(user_message, whisper_language)
 
-    context_text, customer_data, chunks, required_language = await asyncio.gather(
-        _get_context(), _get_customer(), _get_chunks(), _get_language()
+    context_text, customer_data, required_language = await asyncio.gather(
+        _get_context(), _get_customer(), _get_language()
     )
     customer_summary = customer_data.get("summary", "")
-    
+
+    # ------------------------------------------------------------------
+    # Deterministic symptom-intake question cap (code-level, not left to
+    # the LLM's judgment — see symptom_intake_max_questions in config.py).
+    # ------------------------------------------------------------------
+    session_age = await asyncio.to_thread(memory.get_symptom_session_age_seconds, phone_number)
+    if session_age is not None and session_age > settings.symptom_intake_session_timeout_seconds:
+        # Stale session (user went quiet for a long time) — treat this as
+        # a fresh conversation instead of continuing to count against an
+        # abandoned symptom discussion.
+        await asyncio.to_thread(memory.reset_symptom_session, phone_number)
+        questions_asked_so_far = 0
+    else:
+        questions_asked_so_far = await asyncio.to_thread(memory.get_symptom_question_count, phone_number)
+
+    intake_limit_reached = questions_asked_so_far >= settings.symptom_intake_max_questions
+
     # Build enriched prompt with context
     message_type = "[AUDIO MESSAGE]" if is_audio else ""
+    force_answer_instruction = ""
+    if intake_limit_reached:
+        # HARD OVERRIDE: the model has already asked
+        # symptom_intake_max_questions questions in this conversation
+        # (tracked in code, via app/memory.py's symptom_sessions table —
+        # not by asking the model to recall its own question count, which
+        # proved unreliable and caused endless/looping intake questions).
+        # At this point we force it to stop asking and actually answer.
+        force_answer_instruction = f"""
+
+HARD OVERRIDE — READ THIS FIRST: you have already asked {questions_asked_so_far}
+short intake questions in this conversation (tracked separately, this count
+is accurate regardless of what you can see above). Do NOT ask another
+question under any circumstances, even if you feel a detail is still
+missing. Give your best possible answer/guidance right now using
+everything gathered so far, per the normal length/style rules — including
+recommending the user see a doctor if what's been described genuinely
+needs an in-person exam. This instruction overrides SYMPTOM INTAKE MODE
+above."""
+
     enriched_prompt = f"""
 {message_type}
 
@@ -257,25 +300,32 @@ async def generate_context_aware_response(
 Answer only the current user message above, directly and briefly (per the
 system prompt's length rule), using the conversation context only to stay
 consistent — do not re-summarize the context or restate prior messages.
+
+IMPORTANT — read the conversation context above carefully before replying,
+especially if you are in SYMPTOM INTAKE MODE: NEVER ask about a detail
+(duration, severity, associated symptoms, etc.) that the user has ALREADY
+given you anywhere in [CUSTOMER SUMMARY] or the conversation context above.
+Ask about the NEXT missing detail only. If every detail you'd normally ask
+about has already been covered, stop asking questions and give your actual
+answer/guidance instead.
+{force_answer_instruction}
     """.strip()
 
     # required_language was already detected above, concurrently with the
-    # context/RAG gather() — reused here and (via the returned tuple) for
-    # the follow-up suggestion in main.py, instead of get_llm_response()
-    # and generate_followup_suggestion() each running their own
-    # independent (but identical, deterministic) detection call.
+    # context gather() — reused here (via the returned tuple) for the
+    # follow-up suggestion in main.py, instead of get_llm_response() and
+    # generate_followup_suggestion() each running their own independent
+    # (but identical, deterministic) detection call.
 
     # Get LLM response
     try:
         response = await get_llm_response(
             user_message=enriched_prompt,
             conversation_history=[],
-            context_chunks=chunks if chunks else None,
             raw_user_text=user_message,
             whisper_language=whisper_language,
             required_language=required_language,
         )
-        return response, required_language
     except GeminiUnavailableError:
         # Gemini is down/overloaded (503 etc.) — bubble this up so the
         # caller can drop the query silently instead of sending any
@@ -284,6 +334,20 @@ consistent — do not re-summarize the context or restate prior messages.
     except Exception as e:
         logger.error(f"LLM error: {e}", exc_info=True)
         return "Sorry, I ran into an issue. Please try again in a moment.", required_language
+
+    # Update the deterministic question counter based on what actually
+    # came back — increment if the reply is itself another short intake
+    # question, reset back to 0 once the bot actually answers (so the
+    # NEXT new complaint starts counting fresh).
+    try:
+        if _looks_like_a_question(response):
+            await asyncio.to_thread(memory.increment_symptom_question_count, phone_number)
+        else:
+            await asyncio.to_thread(memory.reset_symptom_session, phone_number)
+    except Exception as e:
+        logger.error(f"⚠️ Failed to update symptom session counter for {phone_number}: {e}", exc_info=True)
+
+    return response, required_language
 
 
 SUMMARY_REFRESH_EVERY_N_MESSAGES = 3
@@ -392,7 +456,7 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
                 link = await create_payment_link(
                     phone_number=phone_number,
                     amount_rupees=settings.premium_plan_amount_rupees,
-                    description=f"Steve's AI Lab — {settings.premium_plan_days}-day Premium",
+                    description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
                 )
                 await asyncio.to_thread(
                     memory.save_payment_link,
@@ -404,8 +468,8 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
 
                 expiry_text = (
                     f"Your {settings.premium_plan_days}-day Premium plan has expired. ⌛\n\n"
-                    f"Please buy again to keep enjoying priority access, regular project "
-                    f"updates, and the extra features — here's your payment link:\n"
+                    f"Please buy again to keep getting your daily check-ins and "
+                    f"priority answers — here's your payment link:\n"
                     f"{link['short_url']}"
                 )
                 await send_text_message(phone_number, expiry_text)
@@ -437,7 +501,7 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
         link = await create_payment_link(
             phone_number=phone_number,
             amount_rupees=settings.premium_plan_amount_rupees,
-            description=f"Steve's AI Lab — {settings.premium_plan_days}-day Premium",
+            description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
         )
     except Exception as e:
         logger.error(f"❌ Failed to create/send premium offer for {phone_number}: {e}", exc_info=True)
@@ -453,11 +517,11 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
 
         offer_text = (
             f"Before we dive in — quick heads up 👋\n\n"
-            f"We offer a {settings.premium_plan_days}-day Premium plan for ₹{settings.premium_plan_amount_rupees}. "
+            f"We offer a {settings.premium_plan_days}-day Premium health plan for ₹{settings.premium_plan_amount_rupees}. "
             f"With it you get:\n"
-            f"1. Daily-ish follow-up updates on how we're progressing on your project\n"
-            f"2. Priority access to our team\n"
-            f"3. Extra features unlocked in this chat\n\n"
+            f"1. A personalized daily check-in for {settings.premium_plan_days} days — one small suggestion or to-do each day based on your health goals\n"
+            f"2. Priority, more detailed answers in this chat\n"
+            f"3. A running conversation that adapts as you make progress\n\n"
             f"Totally optional — you can keep chatting normally either way. "
             f"If you'd like to grab it, here's your secure payment link:\n"
             f"{link['short_url']}"
@@ -507,6 +571,22 @@ async def maybe_send_followup(
     a feature nobody is blocked on. Under normal load this never triggers
     and the follow-up behaves exactly as before.
     """
+    # HARD CODE-LEVEL GUARD (not left to the LLM to decide): if the main
+    # reply we just sent is ITSELF already a short intake-style question
+    # (e.g. "How long have you had the fever?", "Any cough?"), never fire
+    # the follow-up system on top of it. Relying on the follow-up LLM call
+    # to notice "the main reply was already a question" was unreliable in
+    # practice — it sometimes fired anyway, producing two questions back
+    # to back (or the same question twice), and could contradict what was
+    # already asked. A simple, deterministic text check here is far more
+    # reliable than asking the model to self-detect this every turn.
+    if _looks_like_a_question(assistant_reply):
+        logger.info(
+            f"⏭️ Skipping follow-up for {phone_number} — main reply is "
+            f"already a short question, avoiding a duplicate/second question."
+        )
+        return
+
     if await is_gemini_busy():
         logger.info(f"⏭️ Skipping follow-up for {phone_number} — Gemini busy, protecting main replies.")
         return
@@ -649,7 +729,8 @@ async def razorpay_webhook(request: Request):
     confirm_text = (
         f"Payment received, thank you! 🎉\n\n"
         f"Your {settings.premium_plan_days}-day Premium plan is now active. "
-        f"You'll start getting regular updates on your project and priority access right here in this chat."
+        f"You'll get a personalized daily check-in right here in this chat for the next "
+        f"{settings.premium_plan_days} days, along with priority answers in the meantime."
     )
     try:
         await send_text_message(phone_number, confirm_text)
@@ -732,10 +813,28 @@ async def _handle_incoming(raw_msg: dict) -> None:
             await asyncio.to_thread(memory.update_summary, sender, "")
             stats = await asyncio.to_thread(memory.get_user_stats, sender)
             logger.info(f"🗑️ Cleared conversation for {sender}. Stats: {stats}")
-            await send_text_message(sender, "Conversation cleared! How can I help you with Steve's AI Lab?")
+            await send_text_message(sender, "Conversation cleared! How can I help you with your health today?")
             return
         
-        if user_text.lower() in ("/models", "/help"):
+        if user_text.lower() == "/help":
+            summary = """
+🤖 AI Health Assistant — Help
+
+Just tell me what's going on with your health, and I'll ask a few quick
+questions if I need more context, then give you clear, practical guidance.
+
+Commands:
+  • /reset — clear our conversation and start fresh
+  • /stats — see your conversation statistics
+  • /models — see the AI models powering this bot
+
+Note: I'm an AI assistant, not a doctor. For diagnosis, prescriptions, or
+anything urgent, please see a licensed healthcare professional.
+            """
+            await send_text_message(sender, summary.strip())
+            return
+
+        if user_text.lower() == "/models":
             # Send summary instead of full list (WhatsApp message limit)
             summary = """
 📊 Available Models:
@@ -1012,74 +1111,12 @@ Type /stats to see your conversation statistics.
         await asyncio.gather(*background_tasks, return_exceptions=True)
 
 
-# ============ EXISTING ENDPOINTS (Ingestion, Testing, Health) ============
-
-@app.post("/ingest/text", tags=["Ingestion"])
-async def ingest_text_endpoint(req: IngestTextRequest):
-    result = await ingest_text(
-        text=req.text,
-        source=req.source,
-        chunk_tokens=req.chunk_tokens,
-        overlap=req.overlap_tokens,
-    )
-    return {"status": "ingested", **result}
-
-
-@app.post("/ingest/file", tags=["Ingestion"])
-async def ingest_file_endpoint(
-    file: UploadFile = File(...),
-    source: str = Form(...),
-    chunk_tokens: int = Form(300),
-    overlap_tokens: int = Form(50),
-):
-    filename = file.filename or "upload"
-    content = await file.read()
-
-    try:
-        text = read_file(filename, content)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    result = await ingest_text(
-        text=text,
-        source=source or filename,
-        chunk_tokens=chunk_tokens,
-        overlap=overlap_tokens,
-    )
-    return {"status": "ingested", "filename": filename, **result}
-
-
-@app.delete("/ingest/source", tags=["Ingestion"])
-async def delete_source_endpoint(req: DeleteSourceRequest):
-    result = await delete_source(req.source)
-    return {"status": "deleted", **result}
-
-
-@app.get("/ingest/stats", tags=["Ingestion"])
-async def ingest_stats():
-    return await get_index_stats()
-
+# ============ EXISTING ENDPOINTS (Testing, Health) ============
 
 @app.post("/test/send-template", tags=["Testing"])
 async def test_send_template(req: TestTemplateRequest):
     result = await send_template_message(req.to, req.template_name)
     return {"status": "sent", "meta_response": result}
-
-
-@app.post("/test/rag", tags=["Testing"])
-async def test_rag(req: TestRAGRequest):
-    chunks = await retrieve_context(req.user_message, top_k=req.top_k)
-    reply = await get_llm_response(
-        user_message=req.user_message,
-        context_chunks=chunks if chunks else None,
-    )
-    return {
-        "user_message": req.user_message,
-        "chunks_retrieved": len(chunks),
-        "chunks": chunks,
-        "llm_reply": reply,
-        "rag_used": len(chunks) > 0,
-    }
 
 
 @app.post("/test/full-flow", tags=["Testing"])
@@ -1111,20 +1148,33 @@ async def test_full_flow(req: TestMessageRequest, background_tasks: BackgroundTa
     }
 
 
+@app.post("/admin/run-daily-checkins", tags=["Health"])
+async def run_daily_checkins_endpoint():
+    """
+    Manually trigger one run of the daily premium check-in job (normally
+    run on a schedule by the dedicated daily_checkin service/process — see
+    app/daily_checkin.py). Useful for testing without waiting for the
+    scheduled hour.
+    """
+    from app.daily_checkin import run_daily_checkins
+    await run_daily_checkins()
+    return {"status": "ok", "message": "Daily check-in run completed."}
+
+
 @app.get("/health", tags=["Health"])
 async def health():
     return {
         "status": "ok",
-        "bot": "Steve's AI Lab Assistant (ENHANCED)",
+        "bot": "AI Health Assistant",
         "phone_number_id": settings.phone_number_id,
-        "pinecone_index": settings.pinecone_index_name,
         "supported_media": ["text", "audio", "image"],
         "features": [
-            "Context-aware responses",
+            "Context-aware health Q&A",
+            "Health profile capture",
             "Audio transcription",
             "Message persistence",
             "Conversation history",
-            "Multiple AI models"
+            "21-day premium daily check-ins",
         ],
     }
 
@@ -1132,32 +1182,14 @@ async def health():
 @app.get("/debug", tags=["Health"])
 async def debug():
     token_check = await verify_token_valid()
-    try:
-        index = get_pinecone_index()
-        # describe_index_stats() is a blocking Pinecone SDK call — offload
-        # it so it doesn't stall the event loop (and every in-flight
-        # WhatsApp request) while this admin/debug endpoint is hit.
-        stats = await asyncio.to_thread(index.describe_index_stats)
-        pinecone_ok = True
-        vector_count = stats.total_vector_count
-    except Exception as e:
-        pinecone_ok = False
-        vector_count = f"error: {e}"
 
     return {
         "config": {
             "phone_number_id": settings.phone_number_id,
-            "pinecone_index": settings.pinecone_index_name,
-            "rag_top_k": settings.rag_top_k,
             "openai_key_set": bool(settings.openai_api_key),
-            "pinecone_key_set": bool(settings.pinecone_api_key),
             "verify_token_set": bool(settings.verify_token),
         },
         "token_check": token_check,
-        "pinecone": {
-            "connected": pinecone_ok,
-            "total_vectors": vector_count,
-        },
         "database": {
             "type": "PostgreSQL",
             "location": memory._safe_url(),

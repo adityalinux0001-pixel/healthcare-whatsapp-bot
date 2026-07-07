@@ -28,11 +28,6 @@ class Settings(BaseSettings):
     # OpenAI (optional, for future use)
     openai_api_key: str = ""
 
-    # Pinecone Vector Database
-    pinecone_api_key: str
-    pinecone_index_name: str
-    pinecone_dimension: int = 1536  # Added
-
     # Eleven Labs Voice Configuration
     eleven_labs_api_key: str
     eleven_labs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"
@@ -55,25 +50,7 @@ class Settings(BaseSettings):
     audio_cache_expiry_hours: int = 24
     audio_output_format: str = "mp3"
 
-    # RAG Configuration
-    rag_top_k: int = 3
     max_history_turns: int = 5
-
-    # Skip embedding + Pinecone query entirely for messages that are
-    # obviously just chit-chat/greetings/acks (e.g. "hi", "thanks", "ok")
-    # — these never benefit from knowledge-base context, so retrieving it
-    # is pure wasted latency (one OpenAI embedding round-trip + one
-    # Pinecone query round-trip) on every single such message.
-    rag_skip_chitchat: bool = True
-
-    # Cache query embeddings in Redis so a repeated/near-identical
-    # question (very common in FAQ-style bots — "pricing?", "pricing",
-    # "what's the pricing") doesn't pay for a fresh OpenAI embedding call
-    # every time. Cache key is the normalized (lowercased/stripped) query
-    # text, so it only helps on close-to-exact repeats — it's a latency
-    # optimization, not a semantic cache.
-    embedding_cache_enabled: bool = True
-    embedding_cache_ttl_seconds: int = 6 * 60 * 60
 
     # Gemini queueing / concurrency control — caps how many Gemini calls
     # (main reply, language detection, summary, vision, etc. — everything
@@ -124,9 +101,46 @@ class Settings(BaseSettings):
     # at the `redis` service in docker-compose.yml by default.
     redis_url: str = "redis://redis:6379/0"
 
-    # Queue backend selection. Supported values: rq, celery, huey.
+    # Queue backend selection. Supported values: rq, celery, huey, kafka.
     queue_backend: str = "rq"
     queue_name: str = "default"
+
+    # --- Kafka (optional queue_backend="kafka") ---
+    # Bootstrap servers, comma-separated (e.g. "kafka:9092" in Docker Compose,
+    # or a cluster of "broker1:9092,broker2:9092" in production).
+    kafka_bootstrap_servers: str = "kafka:9092"
+
+    # Inbound topic: webhook receivers publish raw WhatsApp messages here,
+    # keyed by phone number so all messages from one user land on the same
+    # partition (preserves per-user ordering; see kafka_client.py).
+    kafka_inbound_topic: str = "whatsapp.inbound"
+
+    # Outbound topic: anything that should be sent back to WhatsApp is
+    # published here instead of calling the Cloud API inline. A dedicated
+    # outbound consumer (outbound_worker.py) drains this topic and does the
+    # actual HTTP POSTs to WhatsApp, keyed by phone number for the same
+    # per-user-ordering reason as inbound.
+    kafka_outbound_topic: str = "whatsapp.outbound"
+
+    # Number of partitions to create for each topic if auto-creation is used
+    # or if you provision them yourself with kafka-topics.sh. More
+    # partitions = more parallel workers can consume concurrently, but
+    # ordering is only guaranteed within a partition (i.e. per phone
+    # number, given the partitioning key below), not across the topic.
+    kafka_num_partitions: int = 6
+
+    # Consumer group IDs — all worker processes with the same group id
+    # share the topic's partitions (each partition goes to exactly one
+    # consumer in the group at a time), giving you horizontal scaling by
+    # just starting more worker processes/containers.
+    kafka_inbound_group_id: str = "whatsapp-bot-inbound-workers"
+    kafka_outbound_group_id: str = "whatsapp-bot-outbound-workers"
+
+    # librdkafka producer/consumer tuning. acks=all is the safe default
+    # (wait for all in-sync replicas) — drop to "1" only if you've decided
+    # you can tolerate occasionally losing a message on broker failover.
+    kafka_producer_acks: str = "all"
+    kafka_consumer_auto_offset_reset: str = "earliest"
 
     # Razorpay — Test Mode keys for now (dashboard toggle "Test/Live", keys
     # start with rzp_test_... in test mode, rzp_live_... in live mode).
@@ -139,6 +153,31 @@ class Settings(BaseSettings):
     # Premium plan shown as the upsell at the start of a new conversation.
     premium_plan_amount_rupees: int = 499
     premium_plan_days: int = 21
+
+    # Daily health check-in (premium feature) — every day of the 21-day
+    # premium plan, a background job sends the user one personalized
+    # suggestion/to-do (e.g. an exercise, a diet tip, a reminder) based on
+    # their saved health profile + conversation so far, then continues the
+    # conversation from there. hour is in 24h format, UTC by default —
+    # adjust daily_checkin_hour/timezone via .env to match your users.
+    daily_checkin_enabled: bool = True
+    daily_checkin_hour_utc: int = 9
+    daily_checkin_min_gap_hours: int = 20
+
+    # Symptom intake — hard cap on how many short one-at-a-time questions
+    # (see SYMPTOM INTAKE MODE in app/llm.py's SYSTEM_PROMPT) the bot may
+    # ask before it is FORCED (in code, not left to the LLM's judgment) to
+    # stop asking and give its actual answer/guidance instead. This exists
+    # because relying on the model alone to decide "I have enough now" was
+    # unreliable — it sometimes kept asking indefinitely, or repeated a
+    # question it had already asked.
+    symptom_intake_max_questions: int = 4
+
+    # If a user goes quiet for longer than this after the last intake
+    # question, the NEXT message is treated as a fresh conversation (the
+    # question counter resets) rather than continuing to count against an
+    # abandoned symptom discussion from hours/days ago.
+    symptom_intake_session_timeout_seconds: int = 60 * 60
 
     # A "new session" for the premium upsell = the user's previous message
     # (if any) was this many seconds ago or older. Default 6 hours.

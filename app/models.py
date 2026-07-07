@@ -98,29 +98,10 @@ class TestTemplateRequest(BaseModel):
     template_name: str = "hello_world"
 
 
-class TestRAGRequest(BaseModel):
-    """Test RAG retrieval."""
-    user_message: str
-    top_k: int = 3
-
-
 class TestAudioFlowRequest(BaseModel):
     """Test full audio flow."""
     to: str
     use_voice_response: bool = True
-
-
-class IngestTextRequest(BaseModel):
-    """Ingest plain text into Pinecone."""
-    text: str = Field(..., description="Document text")
-    source: str = Field(..., description="Document label (e.g., 'faq', 'team')")
-    chunk_tokens: int = Field(300, description="Tokens per chunk")
-    overlap_tokens: int = Field(50, description="Overlap between chunks")
-
-
-class DeleteSourceRequest(BaseModel):
-    """Delete all vectors for a source."""
-    source: str
 
 
 class WebhookStatus(BaseModel):
@@ -214,25 +195,6 @@ class VoiceMessageResponse(BaseModel):
     error: Optional[str] = None
 
 
-# ============ RAG & CONTEXT MODELS ============
-
-class ContextChunk(BaseModel):
-    """Retrieved context chunk from Pinecone."""
-    id: str
-    source: str
-    text: str
-    score: float
-    metadata: Optional[dict] = None
-
-
-class RAGResponse(BaseModel):
-    """RAG retrieval response."""
-    chunks_retrieved: int
-    chunks: List[ContextChunk]
-    llm_reply: str
-    rag_used: bool
-
-
 # ============ CONVERSATION MODELS ============
 
 class ConversationTurn(BaseModel):
@@ -257,7 +219,6 @@ class HealthResponse(BaseModel):
     status: str
     bot: str
     phone_number_id: str
-    pinecone_index: str
     active_sessions: int
     supported_media: List[str]
 
@@ -266,6 +227,5 @@ class DebugResponse(BaseModel):
     """Debug information response."""
     config: dict
     token_check: dict
-    pinecone: dict
     active_sessions: int
     media_support: str

@@ -29,6 +29,37 @@ services:
       timeout: 5s
       retries: 10
 
+  # Kafka broker running in KRaft mode (no separate Zookeeper needed).
+  # Only used/needed when QUEUE_BACKEND=kafka; harmless (idle) otherwise.
+  # Single-broker setup for local/dev — for production, run a proper
+  # multi-broker cluster (Confluent Cloud, MSK, Redpanda, self-hosted
+  # multi-node, etc.) and just point KAFKA_BOOTSTRAP_SERVERS at it instead
+  # of running this service.
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: "YLnj4tsXRAmRERgTDjIoVA"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
   app:
     build: .
     restart: unless-stopped
@@ -39,6 +70,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
       QUEUE_NAME: "${QUEUE_NAME:-default}"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       WEB_CONCURRENCY: "${WEB_CONCURRENCY:-8}"
       DB_POOL_MIN_SIZE: "${DB_POOL_MIN_SIZE:-2}"
       DB_POOL_MAX_SIZE: "${DB_POOL_MAX_SIZE:-8}"
@@ -53,6 +85,10 @@ services:
       redis:
         condition: service_healthy
 
+  # Inbound worker(s) — consume raw WhatsApp events (from Kafka, or from
+  # RQ/Celery/Huey depending on QUEUE_BACKEND) and run the core
+  # engines/APIs pipeline (LLM, transcription, vision, Postgres writes).
+  # Scale horizontally with `docker-compose up --scale worker=N`.
   worker:
     build: .
     restart: unless-stopped
@@ -63,9 +99,51 @@ services:
       DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
       QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
       QUEUE_NAME: "${QUEUE_NAME:-default}"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
     command: ["python", "worker.py"]
     volumes:
       - audio_storage:/app/audio_storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Outbound worker — only does anything when QUEUE_BACKEND=kafka. Drains
+  # the outbound topic and performs the actual WhatsApp Cloud API calls,
+  # decoupled from inbound processing so a WhatsApp-side slowdown/rate
+  # limit can't back up message ingestion. Safe to leave running (exits
+  # immediately with a clear log message) when using a non-Kafka backend.
+  outbound_worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
+      QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+    command: ["python", "outbound_worker.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  daily_checkin:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
+    # Runs app/daily_checkin.py's built-in scheduler loop, which wakes up
+    # once a minute and sends that day's premium check-ins once per UTC
+    # day at DAILY_CHECKIN_HOUR_UTC (see app/config.py). Swap this command
+    # for `["python", "-m", "app.daily_checkin", "--once"]` on an external
+    # cron trigger instead, if you'd rather not run a long-lived loop.
+    command: ["python", "-m", "app.daily_checkin"]
     depends_on:
       db:
         condition: service_healthy
@@ -87,3 +165,4 @@ volumes:
   pg_data:
   redis_data:
   audio_storage:
+  kafka_data:
