@@ -88,10 +88,43 @@ services:
   # Inbound worker(s) — consume raw WhatsApp events (from Kafka, or from
   # RQ/Celery/Huey depending on QUEUE_BACKEND) and run the core
   # engines/APIs pipeline (LLM, transcription, vision, Postgres writes).
-  # Scale horizontally with `docker-compose up --scale worker=N`.
+  #
+  # IMPORTANT (RQ/Celery/Huey backends specifically): a single worker
+  # process handles ONE job at a time by design — Worker.work() /
+  # --concurrency=1 / workers=1 all mean exactly that. If only one
+  # `worker` replica is running, three different users messaging within
+  # the same second WILL be served strictly in arrival order, with users
+  # 2 and 3 waiting for user 1's entire reply (including the Gemini API
+  # round trip) to finish first. This is expected RQ/Celery/Huey
+  # behavior, not a bug in the app code — the fix is to run more worker
+  # replicas, e.g.:
+  #     docker-compose up --scale worker=4
+  # (`replicas: 4` below sets this as the default so it isn't
+  # accidentally left at 1; override via --scale at deploy time as
+  # needed). Each replica is an independent consumer pulling from the
+  # same queue, so they naturally process different users' jobs in
+  # parallel.
+  #
+  # The Kafka backend does NOT need multiple replicas for this same
+  # problem — a single Kafka worker process now handles multiple
+  # in-flight messages concurrently via asyncio tasks (see
+  # run_consumer_loop_async in app/kafka_client.py), since different
+  # users' messages land on different partitions anyway. Extra Kafka
+  # worker replicas are still useful for raw throughput/redundancy, just
+  # not required to fix the "first user blocks everyone else" symptom.
   worker:
     build: .
     restart: unless-stopped
+    # NOTE: `deploy.replicas` below only takes effect under `docker stack
+    # deploy` (Swarm mode). If you're running plain `docker-compose up`
+    # (e.g. via Docker Desktop, as most local/dev setups do), that field
+    # is silently ignored and you'll still only get 1 replica — you MUST
+    # pass --scale explicitly instead:
+    #     docker-compose up --scale worker=4
+    # Left the deploy.replicas hint here anyway for anyone who does
+    # eventually move to Swarm/a similar orchestrator.
+    deploy:
+      replicas: 4
     env_file:
       - .env
     environment:
@@ -128,6 +161,31 @@ services:
       db:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+
+  # Dead-letter replay worker — see dead_letter_worker.py's module
+  # docstring. Picks up any inbound message that failed to enqueue (after
+  # its own inline retries) and got persisted to the dead_letter_messages
+  # table instead of being lost, and keeps retrying it in the background
+  # until the underlying queue backend recovers. Single replica is
+  # intentional: dead-letter volume should be near-zero in steady state,
+  # so this doesn't need the same horizontal scaling as `worker`.
+  dead_letter_worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
+      QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
+      QUEUE_NAME: "${QUEUE_NAME:-default}"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+    command: ["python", "dead_letter_worker.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   daily_checkin:

@@ -37,6 +37,7 @@ from app.llm import (
     process_image_with_vision,
     generate_followup_suggestion,
     detect_reply_language,
+    classify_premium_intent,
     is_gemini_busy,
     GeminiUnavailableError,
 )
@@ -265,6 +266,45 @@ async def generate_context_aware_response(
 
     intake_limit_reached = questions_asked_so_far >= settings.symptom_intake_max_questions
 
+    # ------------------------------------------------------------------
+    # Deterministic-ish topic-switch guard: if the CURRENT message is
+    # actually about the premium plan/payment (not a symptom), do not let
+    # the model fall back into the symptom-intake question loop it may
+    # still be mid-way through. Without this, a user switching topics
+    # mid-intake (e.g. fever questions -> "what about the premium plan")
+    # sees the bot ignore their actual message and keep asking symptom
+    # questions, because the LLM re-infers intent each turn from noisy
+    # history and defaults back to whatever intake state it was last in.
+    #
+    # This used to be a `keyword in text.lower()` check against a big
+    # static keyword list (_PREMIUM_INTEREST_KEYWORDS). That broke in
+    # practice: a message like "vegetarian diet for tuberculosis" matched
+    # "diet" and got treated as premium interest even though it has
+    # nothing to do with the plan, and a topic-correction like "no,
+    # tuberculosis diet, not weight loss" still matched "weight loss"
+    # despite the user explicitly declining that topic. Keyword
+    # substring-matching has no concept of negation or context, so it
+    # can't tell those apart. Replaced with classify_premium_intent(), an
+    # isolated small-model call (same pattern as detect_reply_language)
+    # that looks at recent context + the current message and returns a
+    # real premium_related/explicit_request decision instead of a naive
+    # substring match.
+    # ------------------------------------------------------------------
+    topic_switch_instruction = ""
+    if not intake_limit_reached:
+        premium_intent = await classify_premium_intent(user_message, recent_context=context_text)
+        if premium_intent["premium_related"]:
+            topic_switch_instruction = """
+
+HARD OVERRIDE — READ THIS FIRST: the user's CURRENT message is about the
+premium plan/subscription/payment, not a symptom detail. Do NOT ask a
+symptom-intake question in this reply, even if an earlier symptom
+conversation is still visible above. Answer only what they just asked
+about the plan (its content, price, payment link, what it includes, or
+answering their question about it) — do not use their earlier symptom
+description as a reason to change the subject back. If they explicitly
+return to discussing symptoms in a LATER message, intake can resume then."""
+
     # Build enriched prompt with context
     message_type = "[AUDIO MESSAGE]" if is_audio else ""
     force_answer_instruction = ""
@@ -310,6 +350,7 @@ Ask about the NEXT missing detail only. If every detail you'd normally ask
 about has already been covered, stop asking questions and give your actual
 answer/guidance instead.
 {force_answer_instruction}
+{topic_switch_instruction}
     """.strip()
 
     # required_language was already detected above, concurrently with the
@@ -438,7 +479,7 @@ _DEFAULT_PREMIUM_OFFER_COPY = {
 }
 
 
-async def _maybe_send_premium_offer(phone_number: str) -> None:
+async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = False) -> None:
     """
     Runs on EVERY incoming message and decides whether to send a Razorpay
     payment link for the 21-day premium plan. Three cases:
@@ -463,6 +504,15 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
        (default 24h) so a non-paying user chatting all day doesn't get a
        fresh link on every single message — they get it roughly once a
        day until they either pay or stop chatting.
+
+       force_resend=True bypasses this throttle: used when the CURRENT
+       message is an explicit ask for the plan/link (see
+       _requests_premium_plan_explicitly) — a user who directly asks
+       "send me the link" should always get one back, even if the
+       last unpaid link was sent minutes ago. Re-sends the EXISTING
+       unpaid link when there is one (no new Razorpay link/row created)
+       rather than generating a fresh link every time they ask, since
+       the old one is still valid and paying against it works the same.
 
     Runs on every message (no session-gap gate) so case 2 fires on the
     user's very next message after expiry, whenever that happens to be —
@@ -497,6 +547,7 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
                     link["id"],
                     phone_number,
                     settings.premium_plan_amount_rupees * 100,
+                    link.get("short_url"),
                 )
                 await asyncio.to_thread(memory.mark_subscription_expiry_notified, phone_number)
 
@@ -516,7 +567,7 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
         # Case 3: never subscribed, or already notified of this expiry —
         # fall through to the normal throttled recurring reminder below.
         latest_link = await asyncio.to_thread(memory.get_latest_payment_link_for_user, phone_number)
-        if latest_link and latest_link.get("status") != "paid":
+        if latest_link and latest_link.get("status") != "paid" and not force_resend:
             created_at = latest_link.get("created_at")
             if created_at is not None:
                 if created_at.tzinfo is not None:
@@ -530,24 +581,70 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
                     )
                     return
 
-        logger.info(f"🆕 No active premium for {phone_number} — sending premium offer.")
-
-        link = await create_payment_link(
-            phone_number=phone_number,
-            amount_rupees=settings.premium_plan_amount_rupees,
-            description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
-        )
+        resent_existing_link = False
+        if latest_link and latest_link.get("status") != "paid" and force_resend:
+            # Explicit ask — resend the SAME still-valid unpaid link
+            # instead of generating a brand new Razorpay payment link
+            # (avoids piling up duplicate unpaid link rows for one user
+            # every time they ask again within the same throttle window).
+            logger.info(f"🔁 Explicit request — resending existing unpaid link for {phone_number}.")
+            # NOTE: the DB row's primary key column is "payment_link_id",
+            # not "id" (that's only the key name Razorpay's API uses on
+            # the object returned by create_payment_link). Reading
+            # latest_link["id"] here used to raise KeyError on every
+            # resend, which was swallowed by the outer except and logged
+            # as "Failed to create/send premium offer ... 'id'" — silently
+            # breaking every "please send me the link" follow-up.
+            link = {"id": latest_link["payment_link_id"], "short_url": latest_link.get("short_url")}
+            resent_existing_link = True
+            if not link["short_url"]:
+                # Older rows/back-compat safety: if short_url wasn't
+                # stored for some reason, fall back to creating a fresh
+                # link rather than sending a message with no URL in it.
+                link = await create_payment_link(
+                    phone_number=phone_number,
+                    amount_rupees=settings.premium_plan_amount_rupees,
+                    description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
+                )
+                await asyncio.to_thread(
+                    memory.save_payment_link,
+                    link["id"],
+                    phone_number,
+                    settings.premium_plan_amount_rupees * 100,
+                    link.get("short_url"),
+                )
+        else:
+            logger.info(f"🆕 No active premium for {phone_number} — sending premium offer.")
+            link = await create_payment_link(
+                phone_number=phone_number,
+                amount_rupees=settings.premium_plan_amount_rupees,
+                description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
+            )
+            await asyncio.to_thread(
+                memory.save_payment_link,
+                link["id"],
+                phone_number,
+                settings.premium_plan_amount_rupees * 100,
+                link.get("short_url"),
+            )
     except Exception as e:
         logger.error(f"❌ Failed to create/send premium offer for {phone_number}: {e}", exc_info=True)
         return
 
     try:
-        await asyncio.to_thread(
-            memory.save_payment_link,
-            link["id"],
-            phone_number,
-            settings.premium_plan_amount_rupees * 100,
-        )
+        if not resent_existing_link:
+            # Only (re-)insert on paths that created a link this call.
+            # ON CONFLICT DO NOTHING makes this technically safe to call
+            # unconditionally, but skipping it on a pure resend avoids a
+            # pointless DB round trip on every single "send me the link"
+            # follow-up.
+            await asyncio.to_thread(
+                memory.save_payment_link,
+                link["id"],
+                phone_number,
+                settings.premium_plan_amount_rupees * 100,
+                link.get("short_url"),
+            )
 
         category = await asyncio.to_thread(memory.get_user_category, phone_number)
         copy = _PREMIUM_OFFER_COPY.get(category, _DEFAULT_PREMIUM_OFFER_COPY)
@@ -572,28 +669,17 @@ async def _maybe_send_premium_offer(phone_number: str) -> None:
         logger.error(f"❌ Failed to send/save premium offer message for {phone_number}: {e}", exc_info=True)
 
 
-# Keywords that signal the user is actually engaging with health/weight-loss
-# topics, or asking about the plan/subscription itself — as opposed to a
-# bare "hii"/"hello" opener. Deliberately broad/lowercase-matched; a false
-# positive here just means the (harmless, optional) offer shows up a
-# little earlier than strictly necessary, which is fine — a false
-# negative (missing real interest) is the worse failure mode.
-_PREMIUM_INTEREST_KEYWORDS = (
-    "weight", "fat loss", "lose weight", "diet", "workout", "exercise",
-    "gym", "fitness", "calorie", "muscle", "bulk", "yoga", "plan",
-    "premium", "subscribe", "subscription", "price", "cost", "pay",
-    "payment", "buy", "checkup", "health goal", "obese", "obesity",
-)
-
-
-def _shows_premium_interest(user_text: str) -> bool:
-    """True if this message's content itself signals interest in the
-    paid plan/topic (weight loss, diet, workout, or literally asking
-    about the plan/price) — used to decide whether to show the payment
-    link right now, versus just a low-key mention (see
-    _maybe_send_greeting)."""
-    text = user_text.lower()
-    return any(keyword in text for keyword in _PREMIUM_INTEREST_KEYWORDS)
+# NOTE: premium-interest / explicit-request detection used to live here as
+# two `keyword in text.lower()` functions (_shows_premium_interest,
+# _requests_premium_plan_explicitly) against static keyword lists. Both
+# call sites now use classify_premium_intent() from app/llm.py instead —
+# an isolated small-model classifier call, same pattern as
+# detect_reply_language — because substring matching had no way to
+# represent negation or topic-correction (e.g. "vegetarian diet for
+# tuberculosis" matching "diet", or "no, tuberculosis diet, not weight
+# loss" still matching "weight loss" despite explicitly declining that
+# topic). See classify_premium_intent's docstring in app/llm.py for the
+# full rationale.
 
 
 # Very small set of common greeting openers. Only used to pick a friendly
@@ -606,7 +692,7 @@ _GREETING_WORDS = ("hi", "hii", "hiii", "hello", "hey", "heya", "yo", "namaste")
 async def _maybe_send_greeting(phone_number: str) -> bool:
     """
     For a message that does NOT show premium interest (see
-    _shows_premium_interest) — typically a first "hii"/"hello" — send a
+    _shows_premium_interest / now classify_premium_intent) — typically a first "hii"/"hello" — send a
     warm, low-key intro instead of the full payment-link pitch: who the
     bot is, plus a single soft one-liner mentioning the 21-day plan
     exists, with NO link and NO price breakdown. The idea is to
@@ -735,6 +821,27 @@ async def maybe_send_followup(
         logger.error(f"❌ Error generating/sending follow-up for {phone_number}: {e}", exc_info=True)
 
 
+def _safe_enqueue(raw_msg: dict) -> None:
+    """BackgroundTasks-safe wrapper around enqueue_incoming().
+
+    enqueue_incoming() already retries and dead-letters on failure (see
+    app/queueing.py), so this should basically never raise. But
+    BackgroundTasks gives zero visibility if something still does — no
+    crash, no logged traceback by default — so this makes sure any
+    residual exception is at least logged loudly instead of vanishing the
+    way the original message did in the incident this fix addresses.
+    """
+    try:
+        enqueue_incoming(raw_msg)
+    except Exception:
+        logger.critical(
+            "🔥 _safe_enqueue: enqueue_incoming raised even after its own "
+            "retry + dead-letter fallback — message may be lost. "
+            f"raw_msg={raw_msg}",
+            exc_info=True,
+        )
+
+
 # Webhook POST — incoming WhatsApp events
 @app.post("/webhook")
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
@@ -785,7 +892,17 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 # so WhatsApp/Meta never times out and redelivers the same
                 # event, which is what was causing duplicate delayed replies
                 # when Gemini was slow/erroring.
-                background_tasks.add_task(enqueue_incoming, raw_msg)
+                #
+                # enqueue_incoming() itself now retries transient failures
+                # and falls back to a durable dead-letter row on Postgres
+                # (see app/queueing.py) instead of raising in the common
+                # case. _safe_enqueue below is the last line of defense
+                # for the one case it can still raise: the dead-letter DB
+                # write itself failing too. FastAPI's BackgroundTasks
+                # swallows exceptions from tasks silently — without this
+                # wrapper, that failure mode would go back to being
+                # invisible, which is exactly the bug we're fixing.
+                background_tasks.add_task(_safe_enqueue, raw_msg)
 
     return {"status": "ok"}
 
@@ -932,15 +1049,59 @@ async def _handle_incoming(raw_msg: dict) -> None:
         # ============ PREMIUM UPSELL: only when the message itself shows
         # interest (weight-loss/health-goal talk, or explicitly asking
         # about the plan/subscription) — NOT on every generic "hii"/
-        # "hello" opener. A brand new user who just says hi gets a warm,
+        # "hello" opener, and NOT when the message merely shares a word
+        # with plan-related vocabulary (e.g. "diet") while actually being
+        # about something else entirely, or explicitly correcting/
+        # declining an earlier misfire (e.g. "no, tuberculosis diet, not
+        # weight loss"). A brand new user who just says hi gets a warm,
         # low-key intro instead (see _maybe_send_greeting below); the
         # payment-link pitch only fires once they've actually engaged
-        # with the topic. Awaited (not fire-and-forget) and placed before
-        # any save_message()/append_turn() call for this turn — those
+        # with the topic.
+        #
+        # This used to be `_shows_premium_interest(user_text)` — a
+        # `keyword in text.lower()` substring check against a large
+        # static keyword list. That's what produced the exact bug seen in
+        # production: a user saying "vegetarian diet for tuberculosis"
+        # matched "diet" and got the fat-loss-plan pitch instead of an
+        # answer, and every follow-up attempt to redirect back to
+        # tuberculosis ("no, tuberculosis diet, not weight loss") still
+        # matched "weight loss"/"diet" and re-triggered the same canned
+        # pitch, effectively locking the user out of ever getting their
+        # real question answered. Keyword substring-matching can't
+        # represent negation or topic-correction, so no tweak to the
+        # keyword list can fully fix it — this needs actual intent
+        # understanding, which is what classify_premium_intent()
+        # provides (small isolated Gemini call, same proven pattern as
+        # detect_reply_language, with recent context so it can see when
+        # the user is correcting a prior turn).
+        #
+        # Awaited (not fire-and-forget) and placed before any
+        # save_message()/append_turn() call for this turn — those
         # overwrite last_message_at with "now", so reading it after
         # saving would always look like 0 seconds have passed. ============
-        if _shows_premium_interest(user_text):
-            await _maybe_send_premium_offer(sender)
+        recent_context_for_intent = await asyncio.to_thread(
+            memory.get_conversation_context, sender, limit=5
+        )
+        premium_intent = await classify_premium_intent(
+            user_text, recent_context=recent_context_for_intent
+        )
+        if premium_intent["premium_related"]:
+            explicit_request = premium_intent["explicit_request"]
+            await _maybe_send_premium_offer(sender, force_resend=explicit_request)
+            if explicit_request:
+                # The user directly asked for the plan/payment link and
+                # _maybe_send_premium_offer just sent it (or skipped only
+                # because they already have an active subscription/it's
+                # genuinely unavailable — either way, that IS the answer
+                # to this turn). Stop here so the generic LLM Q&A path
+                # below doesn't also generate a second, contradictory
+                # reply for the same message — e.g. hallucinating "I
+                # can't provide direct purchase links" right after the
+                # link was actually sent, which is confusing and wrong.
+                await asyncio.to_thread(
+                    memory.save_message, sender, "user", user_text, message_type="text"
+                )
+                return
         else:
             greeted = await _maybe_send_greeting(sender)
             if greeted:
@@ -1350,6 +1511,13 @@ async def run_daily_checkins_endpoint():
 
 @app.get("/health", tags=["Health"])
 async def health():
+    # Surface dead-letter backlog in the health payload so it's visible
+    # to whatever's already polling /health (uptime checks, dashboards)
+    # without needing a separate alert wired up from day one. A non-zero
+    # count here means messages failed to enqueue and are waiting on
+    # dead_letter_worker.py to replay them — worth alerting on if it
+    # stays non-zero for more than a few minutes.
+    pending_dead_letters = await asyncio.to_thread(memory.count_pending_dead_letters)
     return {
         "status": "ok",
         "bot": "AI Health Assistant",
@@ -1363,7 +1531,42 @@ async def health():
             "Conversation history",
             "21-day premium daily check-ins",
         ],
+        "pending_dead_letters": pending_dead_letters,
     }
+
+
+@app.get("/debug/dead-letters", tags=["Health"])
+async def list_dead_letters(limit: int = Query(50, ge=1, le=500)):
+    """Inspect pending dead-lettered inbound messages — i.e. messages
+    that failed to enqueue after retries and are waiting for
+    dead_letter_worker.py's next cycle (or manual replay below)."""
+    rows = await asyncio.to_thread(memory.get_pending_dead_letters, limit)
+    return {"count": len(rows), "pending_dead_letters": rows}
+
+
+@app.post("/debug/dead-letters/{dead_letter_id}/replay", tags=["Health"])
+async def replay_dead_letter(dead_letter_id: int):
+    """Manually force-replay a single dead-lettered message right now,
+    instead of waiting for dead_letter_worker.py's next poll cycle —
+    useful right after fixing whatever caused the original outage."""
+    rows = await asyncio.to_thread(memory.get_pending_dead_letters, 500)
+    row = next((r for r in rows if r["id"] == dead_letter_id), None)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending dead-letter with id={dead_letter_id}",
+        )
+
+    job_ref = await asyncio.to_thread(enqueue_incoming, row["payload"])
+    if job_ref.startswith("dead_letter:"):
+        return {
+            "status": "still_failing",
+            "dead_letter_id": dead_letter_id,
+            "detail": "Replay attempted but the queue backend is still failing; left pending.",
+        }
+
+    await asyncio.to_thread(memory.mark_dead_letter_resolved, dead_letter_id)
+    return {"status": "resolved", "dead_letter_id": dead_letter_id, "job_ref": job_ref}
 
 
 @app.get("/debug", tags=["Health"])

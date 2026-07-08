@@ -142,6 +142,25 @@ class Settings(BaseSettings):
     kafka_producer_acks: str = "all"
     kafka_consumer_auto_offset_reset: str = "earliest"
 
+    # How many inbound messages a single worker process will handle
+    # concurrently (as asyncio tasks) instead of strictly one-at-a-time.
+    # This is what actually fixes "second/third user has to wait for the
+    # first user's reply to finish" — before this, a single worker
+    # process processed messages fully serially even though the topic
+    # has multiple partitions, because handle_message() blocked the only
+    # consumer loop until it returned.
+    #
+    # NOTE: this USED to need to stay <= kafka_num_partitions, back when
+    # run_consumer_loop_async gated concurrency per-partition (a single
+    # partition could only have one message in flight). That gate is now
+    # per phone-number-key instead (see run_consumer_loop_async's
+    # docstring in app/kafka_client.py) — per-user ordering is preserved
+    # without tying this to the partition count, so it's fine to set
+    # this higher than kafka_num_partitions if you have enough concurrent
+    # users to benefit and your downstream (Gemini rate limits, DB pool
+    # size) can handle it.
+    kafka_worker_max_concurrent: int = 6
+
     # Razorpay — Test Mode keys for now (dashboard toggle "Test/Live", keys
     # start with rzp_test_... in test mode, rzp_live_... in live mode).
     # key_secret and webhook_secret are two DIFFERENT secrets in Razorpay's

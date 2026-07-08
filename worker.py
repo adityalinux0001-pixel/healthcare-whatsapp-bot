@@ -65,7 +65,7 @@ def main() -> None:
         try:
             import asyncio
 
-            from app.kafka_client import ensure_topics, run_consumer_loop
+            from app.kafka_client import ensure_topics, run_consumer_loop_async
             from app.main import _handle_incoming
         except ImportError as exc:
             logger.error("Kafka backend selected but confluent-kafka is not installed: %s", exc)
@@ -78,38 +78,31 @@ def main() -> None:
             [settings.kafka_inbound_topic], num_partitions=settings.kafka_num_partitions
         )
 
-        # IMPORTANT: unlike RQ/Celery/Huey (which run _run_handle, doing a
-        # fresh asyncio.run() per job — fine there because each job is
-        # otherwise isolated), the Kafka consumer loop is one long-running
-        # process handling many messages back to back on the SAME asyncio
-        # event loop. asyncio.run() creates AND CLOSES a new loop every
-        # single call. Shared async clients that get lazily created and
-        # cached on first use — e.g. app/redis_client.py's module-level
-        # redis.asyncio singleton, used by the idempotency guard and the
-        # Gemini concurrency semaphore — bind their connections to
-        # whichever loop was running when they were first created. Once
-        # that loop closes after message #1, message #2 tries to reuse
-        # the same cached Redis client against a NOW-CLOSED loop, raising
-        # "Future attached to a different loop" / "Event loop is closed".
-        # Fix: create ONE event loop for this worker process up front and
-        # run every message's handling coroutine on that same loop via
-        # run_until_complete, so the Redis client (and any other lazily-
-        # cached async client) is always used from the loop it was born on.
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        def _handle_kafka_message(raw_msg: dict) -> None:
-            loop.run_until_complete(_handle_incoming(raw_msg))
-
-        logger.info("Starting Kafka inbound consumer for WhatsApp bot")
+        # Run the whole consumer loop as one coroutine on one asyncio
+        # loop for the lifetime of the process. Unlike the old
+        # run_until_complete-per-message approach, this loop stays open
+        # the entire time — so any lazily-cached async client (e.g.
+        # app/redis_client.py's module-level redis.asyncio singleton)
+        # only ever binds to this one loop, and multiple messages'
+        # _handle_incoming() coroutines can genuinely run concurrently as
+        # tasks instead of one fully finishing before the next starts.
+        # This is what fixes "whoever messages first blocks everyone
+        # else" — different users' messages land on different Kafka
+        # partitions (keyed by phone number) and now actually get
+        # processed in parallel instead of queueing behind each other on
+        # a single blocking consumer loop.
+        logger.info("Starting Kafka inbound consumer for WhatsApp bot (concurrent)")
         try:
-            run_consumer_loop(
-                topic=settings.kafka_inbound_topic,
-                group_id=settings.kafka_inbound_group_id,
-                handle_message=_handle_kafka_message,
+            asyncio.run(
+                run_consumer_loop_async(
+                    topic=settings.kafka_inbound_topic,
+                    group_id=settings.kafka_inbound_group_id,
+                    handle_message=_handle_incoming,
+                    max_concurrent=settings.kafka_worker_max_concurrent,
+                )
             )
-        finally:
-            loop.close()
+        except KeyboardInterrupt:
+            logger.info("Kafka worker interrupted — shutting down.")
         return
 
     logger.error("Unsupported queue backend: %s", settings.queue_backend)

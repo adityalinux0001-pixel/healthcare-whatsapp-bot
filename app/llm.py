@@ -3,6 +3,7 @@ import logging
 import random
 import base64
 import uuid
+import json as _json
 from functools import lru_cache
 from app.config import get_settings
 from app.redis_client import get_redis
@@ -364,6 +365,151 @@ async def detect_reply_language(
     """
     client = _get_client()
     return await _detect_reply_language(client, text, whisper_language)
+
+
+async def _classify_premium_intent(
+    client: "genai.Client",
+    user_text: str,
+    recent_context: str = "",
+) -> dict:
+    """
+    Small, isolated Gemini call that decides whether the user's CURRENT
+    message is actually about the premium plan/subscription/payment (and,
+    if so, whether they're directly asking for it right now).
+
+    Replaces the old approach of `keyword in text.lower()` substring
+    matching against a big static list (_PREMIUM_INTEREST_KEYWORDS /
+    _PREMIUM_EXPLICIT_REQUEST_KEYWORDS). That approach broke in two
+    concrete, observed ways:
+
+    1. False positives from unrelated words that happen to contain a
+       trigger substring or co-occur with one — e.g. "vegetarian diet
+       for tuberculosis" matched "diet" and got treated as premium
+       interest, and "no, tuberculosis diet, not weight loss" still
+       matched "weight loss" even though the user was explicitly
+       correcting/declining that topic.
+    2. No concept of negation or topic-correction at all — a keyword
+       list can't tell "I want the plan" apart from "I don't want the
+       plan" or "that's not what I meant".
+
+    This mirrors _detect_reply_language's pattern exactly: an isolated,
+    cheap, low-latency classifier call with a tightly constrained output
+    format, given only the current message plus a little recent context
+    (not the full conversation, to keep it fast and avoid the model
+    getting confused by older unrelated turns — same rationale as
+    language detection).
+
+    Returns a dict:
+      {
+        "premium_related": bool,   # current message is about the plan/
+                                    # payment/subscription (topic gate —
+                                    # equivalent to old _shows_premium_interest)
+        "explicit_request": bool,  # user is directly asking for the plan
+                                    # or its payment link RIGHT NOW
+                                    # (equivalent to old
+                                    # _requests_premium_plan_explicitly)
+      }
+
+    On any failure (network/API error, unparsable response), falls back
+    to {"premium_related": False, "explicit_request": False} — i.e. fail
+    CLOSED. A missed upsell opportunity is a minor, recoverable business
+    cost; a wrongly-triggered upsell that hijacks a health question (the
+    original bug) is a worse user-facing failure, so the safe default on
+    error is "don't trigger", not "trigger".
+    """
+    stripped = user_text.strip()
+    if not stripped:
+        return {"premium_related": False, "explicit_request": False}
+
+    prompt_parts = []
+    if recent_context:
+        prompt_parts.append(f"Recent conversation (oldest to newest):\n{recent_context}\n")
+    prompt_parts.append(f"CURRENT user message: {stripped[:500]}")
+    contents_text = "\n".join(prompt_parts)
+
+    try:
+        response = await _call_gemini(
+            lambda: client.aio.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Part(text=contents_text)],
+                config=types.GenerateContentConfig(
+                    system_instruction=(
+                        "You are an intent classifier for a WhatsApp health "
+                        "assistant bot that also sells an optional paid "
+                        "21-day premium plan. You will be shown a little "
+                        "recent conversation context (optional) and the "
+                        "user's CURRENT message. Decide two yes/no things "
+                        "about the CURRENT message ONLY:\n\n"
+                        "1. premium_related: is the CURRENT message actually "
+                        "about the paid premium plan, subscription, or "
+                        "payment/pricing for it — as opposed to a general "
+                        "health/diet/symptom/nutrition question that merely "
+                        "shares a word with plan-related vocabulary?\n"
+                        "   - A message about diet/food/exercise for a "
+                        "medical condition (e.g. tuberculosis, diabetes, "
+                        "thyroid) is NOT premium_related, even if it "
+                        "contains words like 'diet' or 'plan' in a generic "
+                        "sense (e.g. 'meal plan for TB').\n"
+                        "   - A message that corrects or clarifies a "
+                        "PREVIOUS misunderstanding — e.g. 'no, I meant "
+                        "tuberculosis, not weight loss' — is NOT "
+                        "premium_related, even though it may reference a "
+                        "weight-loss/diet word while doing so. The intent "
+                        "here is topic correction, not plan interest.\n"
+                        "   - A message that says no / not interested / "
+                        "stop / cancel with respect to the plan is NOT "
+                        "premium_related (there's nothing to offer/answer "
+                        "about right now).\n"
+                        "   - A message directly asking about the plan's "
+                        "price, content, payment link, how to subscribe, "
+                        "or genuinely expressing interest in losing weight/ "
+                        "getting fit as their OWN goal (not as a correction "
+                        "or unrelated topic) IS premium_related.\n\n"
+                        "2. explicit_request: only meaningful if "
+                        "premium_related is true. Is the user directly and "
+                        "unambiguously asking to receive the plan or its "
+                        "payment link RIGHT NOW (e.g. 'send me the link', "
+                        "'I want to buy it', 'how do I pay')? A message "
+                        "that just mentions the topic in passing, or asks "
+                        "a clarifying question about it, is premium_related "
+                        "but NOT explicit_request.\n\n"
+                        "Respond with ONLY a JSON object, nothing else, no "
+                        "markdown fences, no explanation:\n"
+                        '{"premium_related": true|false, '
+                        '"explicit_request": true|false}'
+                    ),
+                    max_output_tokens=60,
+                    temperature=0.0,
+                ),
+            ),
+            label="premium intent classification",
+        )
+        raw = (response.text or "").strip()
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        parsed = _json.loads(raw)
+        premium_related = bool(parsed.get("premium_related", False))
+        explicit_request = bool(parsed.get("explicit_request", False)) and premium_related
+        return {"premium_related": premium_related, "explicit_request": explicit_request}
+    except Exception as e:
+        logger.warning(
+            f"Premium intent classification failed, defaulting to False/False: {e}"
+        )
+        return {"premium_related": False, "explicit_request": False}
+
+
+async def classify_premium_intent(
+    user_text: str,
+    recent_context: str = "",
+) -> dict:
+    """
+    Public wrapper around _classify_premium_intent() for callers outside
+    this module (main.py). See that function's docstring for the full
+    rationale and return shape.
+    """
+    client = _get_client()
+    return await _classify_premium_intent(client, user_text, recent_context)
 
 
 SYSTEM_PROMPT = """You are an AI health assistant on WhatsApp. You act like a

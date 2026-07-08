@@ -197,9 +197,17 @@ class ConversationMemory:
                     amount_paise INTEGER NOT NULL,
                     status TEXT NOT NULL DEFAULT 'created',
                     razorpay_payment_id TEXT,
+                    short_url TEXT,
                     created_at TIMESTAMPTZ DEFAULT now(),
                     paid_at TIMESTAMPTZ
                 )
+            ''')
+            # Back-compat: add short_url to any payment_links table created
+            # before this column existed. IF NOT EXISTS makes this a no-op
+            # on fresh databases where the CREATE TABLE above already
+            # included it.
+            cur.execute('''
+                ALTER TABLE payment_links ADD COLUMN IF NOT EXISTS short_url TEXT
             ''')
             cur.execute('''
                 CREATE INDEX IF NOT EXISTS idx_payment_links_phone
@@ -334,6 +342,38 @@ class ConversationMemory:
                     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
+            ''')
+
+            # Durable fallback for inbound messages that failed to reach
+            # Kafka (or whichever queue backend is active) after the
+            # webhook already ack'd 200 to Meta. Without this table, a
+            # publish() failure inside a FastAPI BackgroundTasks job is
+            # unrecoverable — no exception surfaces anywhere, no retry,
+            # no record the message ever existed. This table is the
+            # "durable record of the failure" — at minimum we can alert
+            # on non-empty pending rows, and app/dead_letter_worker.py
+            # (or an on-demand replay) can re-run enqueue_incoming for
+            # each row later.
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS dead_letter_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    phone_number TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    failure_reason TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    first_failed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    last_failed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    resolved_at TIMESTAMPTZ
+                )
+            ''')
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_dead_letter_status
+                ON dead_letter_messages(status, first_failed_at)
+            ''')
+            cur.execute('''
+                CREATE INDEX IF NOT EXISTS idx_dead_letter_phone
+                ON dead_letter_messages(phone_number, first_failed_at DESC)
             ''')
 
             conn.commit()
@@ -555,14 +595,17 @@ class ConversationMemory:
     # Razorpay payments
     # ------------------------------------------------------------------
 
-    def save_payment_link(self, payment_link_id: str, phone_number: str, amount_paise: int) -> None:
+    def save_payment_link(
+        self, payment_link_id: str, phone_number: str, amount_paise: int,
+        short_url: Optional[str] = None,
+    ) -> None:
         with self._get_conn() as conn:
             cur = conn.cursor()
             cur.execute('''
-                INSERT INTO payment_links (payment_link_id, phone_number, amount_paise, status)
-                VALUES (%s, %s, %s, 'created')
+                INSERT INTO payment_links (payment_link_id, phone_number, amount_paise, status, short_url)
+                VALUES (%s, %s, %s, 'created', %s)
                 ON CONFLICT (payment_link_id) DO NOTHING
-            ''', (payment_link_id, phone_number, amount_paise))
+            ''', (payment_link_id, phone_number, amount_paise, short_url))
             conn.commit()
 
     def get_payment_link(self, payment_link_id: str) -> Optional[Dict]:
@@ -1036,3 +1079,104 @@ class ConversationMemory:
             if started_at.tzinfo is not None:
                 started_at = started_at.replace(tzinfo=None)
             return (datetime.utcnow() - started_at).total_seconds()
+
+    # ------------------------------------------------------------------
+    # Dead-letter queue (failed inbound-message enqueues)
+    # ------------------------------------------------------------------
+    #
+    # Called from app/queueing.py's enqueue_incoming() whenever publishing
+    # to the active queue backend (Kafka/RQ/Celery/Huey) raises. This is
+    # the durable fallback: instead of a message silently vanishing inside
+    # a swallowed BackgroundTasks exception, it lands here with the full
+    # original payload, so it can be inspected, alerted on, and replayed
+    # without asking the user to resend anything.
+
+    def save_dead_letter(
+        self, phone_number: str, payload: dict, failure_reason: str,
+    ) -> int:
+        """Persist a failed enqueue. If an identical *pending* payload for
+        this phone number already exists (e.g. two rapid retries hit the
+        same underlying outage), bump its attempt count instead of
+        creating a duplicate row."""
+        import json as _json
+
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT id FROM dead_letter_messages
+                WHERE phone_number = %s
+                  AND status = 'pending'
+                  AND payload = %s::jsonb
+                ORDER BY first_failed_at DESC
+                LIMIT 1
+            ''', (phone_number, _json.dumps(payload)))
+            existing = cur.fetchone()
+
+            if existing:
+                dead_letter_id = existing[0]
+                cur.execute('''
+                    UPDATE dead_letter_messages
+                    SET attempts = attempts + 1,
+                        failure_reason = %s,
+                        last_failed_at = now()
+                    WHERE id = %s
+                ''', (failure_reason, dead_letter_id))
+            else:
+                cur.execute('''
+                    INSERT INTO dead_letter_messages
+                        (phone_number, payload, failure_reason)
+                    VALUES (%s, %s::jsonb, %s)
+                    RETURNING id
+                ''', (phone_number, _json.dumps(payload), failure_reason))
+                dead_letter_id = cur.fetchone()[0]
+
+            conn.commit()
+            return dead_letter_id
+
+    def get_pending_dead_letters(self, limit: int = 100) -> List[Dict]:
+        """Oldest-first batch of not-yet-recovered failed messages —
+        used by the replay worker / admin endpoint."""
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute('''
+                SELECT * FROM dead_letter_messages
+                WHERE status = 'pending'
+                ORDER BY first_failed_at ASC
+                LIMIT %s
+            ''', (limit,))
+            return [dict(row) for row in cur.fetchall()]
+
+    def mark_dead_letter_resolved(self, dead_letter_id: int) -> None:
+        """Call after successfully replaying a dead-lettered message."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE dead_letter_messages
+                SET status = 'resolved', resolved_at = now()
+                WHERE id = %s
+            ''', (dead_letter_id,))
+            conn.commit()
+
+    def mark_dead_letter_failed_permanently(self, dead_letter_id: int) -> None:
+        """Call when a replay attempt itself fails again past a retry
+        ceiling — keeps it out of get_pending_dead_letters() so the
+        replay worker doesn't spin forever, while still keeping the row
+        for manual/operator inspection."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE dead_letter_messages
+                SET status = 'failed_permanently'
+                WHERE id = %s
+            ''', (dead_letter_id,))
+            conn.commit()
+
+    def count_pending_dead_letters(self) -> int:
+        """Cheap count for a health/metrics endpoint — alert if this
+        stays above zero for more than a few minutes."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM dead_letter_messages WHERE status = 'pending'"
+            )
+            return cur.fetchone()[0]
