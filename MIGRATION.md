@@ -146,7 +146,6 @@ docker compose up --scale worker=3 --scale outbound_worker=2
   text/template/read-receipt jobs go through `app/outbound_queue.py`
   today — putting raw audio/document bytes through Kafka messages is
   usually the wrong call (message-size limits, broker disk pressure). If
-  you need those queued too, upload the media to object storage first
   and queue a reference instead of the raw bytes.
 - **Single-broker Kafka in `docker-compose.yml` is for local/dev only.**
   For production, point `KAFKA_BOOTSTRAP_SERVERS` at a real multi-broker

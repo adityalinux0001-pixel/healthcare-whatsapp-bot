@@ -31,18 +31,18 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from app.config import get_settings
-from app.memory import ConversationMemory
-from app.whatsapp import send_text_message
+from app.core.config import get_settings
+from app.services.memory import ConversationMemory
+from app.services.whatsapp import send_text_message
 
 logger = logging.getLogger("daily_checkin")
 
 settings = get_settings()
 
 memory = ConversationMemory(
-    database_url=settings.database_url,
-    pool_min_size=settings.db_pool_min_size,
-    pool_max_size=settings.db_pool_max_size,
+    database_url=settings.DATABASE_URL,
+    pool_min_size=settings.DB_POOL_MIN_SIZE,
+    pool_max_size=settings.DB_POOL_MAX_SIZE,
 )
 
 
@@ -66,19 +66,16 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
     """
     now = datetime.utcnow()
 
-    # Throttle: don't send a second check-in within
-    # daily_checkin_min_gap_hours of the last one for this user (covers
-    # the job being triggered more than once in a day, manual re-runs,
-    # restarts, etc.).
+
     last_sent_at = await asyncio.to_thread(memory.get_last_checkin_sent_at, phone_number)
     if last_sent_at is not None:
         if last_sent_at.tzinfo is not None:
             last_sent_at = last_sent_at.replace(tzinfo=None)
         hours_since = (now - last_sent_at).total_seconds() / 3600
-        if hours_since < settings.daily_checkin_min_gap_hours:
+        if hours_since < settings.DAILY_CHECKIN_MIN_GAP_HOURS:
             logger.info(
                 f"⏭️ Skipping check-in for {phone_number} — last one sent "
-                f"{hours_since:.1f}h ago (throttle: {settings.daily_checkin_min_gap_hours}h)."
+                f"{hours_since:.1f}h ago (throttle: {settings.DAILY_CHECKIN_MIN_GAP_HOURS}h)."
             )
             return
 
@@ -94,7 +91,7 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
         return
 
     day_number = plan_day["day_number"]
-    header = f"*Day {day_number} of {settings.premium_plan_days}* 🗓️\n\n"
+    header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
     message = header + plan_day["message_text"]
     followup_question = plan_day.get("followup_question")
 
@@ -104,15 +101,12 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
         await asyncio.to_thread(
             memory.save_message, phone_number, "assistant", message, message_type="text"
         )
-        logger.info(f"✅ Sent day {day_number}/{settings.premium_plan_days} check-in to {phone_number}")
+        logger.info(f"✅ Sent day {day_number}/{settings.PREMIUM_PLAN_DAYS} check-in to {phone_number}")
     except Exception as e:
         logger.error(f"❌ Failed to send/save check-in for {phone_number}: {e}", exc_info=True)
         return
 
-    # Same-day follow-up question, sent right after the day's message.
-    # The user's reply is captured by app/main.py's webhook handler
-    # (checks memory.get_awaiting_followup_day before normal Q&A routing)
-    # — this job's job ends here.
+
     if followup_question:
         try:
             await send_text_message(phone_number, followup_question)
@@ -133,7 +127,7 @@ async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
     check-in hour (set during onboarding question 8 - see
     app/onboarding.py) matches `current_hour_utc`, send their next
     pregenerated check-in. Users who never answered a parseable time
-    already have settings.daily_checkin_hour_utc stored as their
+    already have settings.DAILY_CHECKIN_HOUR_UTC stored as their
     effective hour (baked in by memory.set_preferred_checkin_hour at
     onboarding time), so no extra fallback logic is needed here.
 
@@ -143,7 +137,7 @@ async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
     explicitly since it now wakes up once per hour instead of once per
     day, to support per-user preferred hours.
     """
-    if not settings.daily_checkin_enabled:
+    if not settings.DAILY_CHECKIN_ENABLED:
         logger.info("Daily check-in feature disabled (daily_checkin_enabled=False) — skipping run.")
         return
 
@@ -155,7 +149,7 @@ async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
         u for u in users
         if (u.get("preferred_checkin_hour_utc")
             if u.get("preferred_checkin_hour_utc") is not None
-            else settings.daily_checkin_hour_utc) == current_hour_utc
+            else settings.DAILY_CHECKIN_HOUR_UTC) == current_hour_utc
     ]
     logger.info(
         f"📅 Daily check-in run starting for hour {current_hour_utc}:00 UTC — "
@@ -179,7 +173,7 @@ async def _run_forever() -> None:
     hour, runs the batch for that hour. Needed now that each user can
     have their own preferred check-in hour (see app/onboarding.py
     question 8 and memory.set_preferred_checkin_hour) instead of
-    everyone sharing one fixed settings.daily_checkin_hour_utc.
+    everyone sharing one fixed settings.DAILY_CHECKIN_HOUR_UTC.
     """
     last_run_key = None
     logger.info(
@@ -202,7 +196,7 @@ if __name__ == "__main__":
     import sys
 
     logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
         format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
     )
 

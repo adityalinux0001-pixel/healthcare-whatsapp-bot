@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from app.config import get_settings
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +40,17 @@ JOB_MARK_AS_READ = "mark_as_read"
 
 
 def _use_kafka() -> bool:
-    return (get_settings().queue_backend or "rq").lower() == "kafka"
+    return (get_settings().QUEUE_BACKEND or "rq").lower() == "kafka"
 
 
 async def enqueue_send_text(to: str, text: str, reply_to: Optional[str] = None) -> dict[str, Any]:
     """Queue (or, if not using Kafka, immediately send) a text message."""
     if _use_kafka():
-        from app.kafka_client import publish
+        from app.core.kafka_client import publish
 
         settings = get_settings()
         publish(
-            settings.kafka_outbound_topic,
+            settings.KAFKA_OUTBOUND_TOPIC,
             key=to,
             value={
                 "job_type": JOB_SEND_TEXT,
@@ -59,20 +59,20 @@ async def enqueue_send_text(to: str, text: str, reply_to: Optional[str] = None) 
                 "reply_to": reply_to,
             },
         )
-        return {"status": "queued", "topic": settings.kafka_outbound_topic, "to": to}
+        return {"status": "queued", "topic": settings.KAFKA_OUTBOUND_TOPIC, "to": to}
 
-    from app.whatsapp import send_text_message
+    from app.services.whatsapp import send_text_message
 
     return await send_text_message(to, text, reply_to=reply_to)
 
 
 async def enqueue_send_template(to: str, template_name: str, params: Optional[list] = None) -> dict[str, Any]:
     if _use_kafka():
-        from app.kafka_client import publish
+        from app.core.kafka_client import publish
 
         settings = get_settings()
         publish(
-            settings.kafka_outbound_topic,
+            settings.KAFKA_OUTBOUND_TOPIC,
             key=to,
             value={
                 "job_type": JOB_SEND_TEMPLATE,
@@ -81,9 +81,9 @@ async def enqueue_send_template(to: str, template_name: str, params: Optional[li
                 "params": params,
             },
         )
-        return {"status": "queued", "topic": settings.kafka_outbound_topic, "to": to}
+        return {"status": "queued", "topic": settings.KAFKA_OUTBOUND_TOPIC, "to": to}
 
-    from app.whatsapp import send_template_message
+    from app.services.whatsapp import send_template_message
 
     return await send_template_message(to, template_name, params=params)
 
@@ -98,11 +98,11 @@ async def enqueue_mark_as_read(message_id: str, to: str, show_typing: bool = Fal
     per-user ordering consistent across job types.
     """
     if _use_kafka():
-        from app.kafka_client import publish
+        from app.core.kafka_client import publish
 
         settings = get_settings()
         publish(
-            settings.kafka_outbound_topic,
+            settings.KAFKA_OUTBOUND_TOPIC,
             key=to,
             value={
                 "job_type": JOB_MARK_AS_READ,
@@ -110,8 +110,8 @@ async def enqueue_mark_as_read(message_id: str, to: str, show_typing: bool = Fal
                 "show_typing": show_typing,
             },
         )
-        return {"status": "queued", "topic": settings.kafka_outbound_topic}
+        return {"status": "queued", "topic": settings.KAFKA_OUTBOUND_TOPIC}
 
-    from app.whatsapp import mark_as_read
+    from app.services.whatsapp import mark_as_read
 
     return await mark_as_read(message_id, show_typing=show_typing)

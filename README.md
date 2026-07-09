@@ -1,12 +1,13 @@
 # whatsapp-bot-multiworker
 
-A multi-worker WhatsApp bot built with Python. This repository provides a scalable worker-based architecture for handling WhatsApp messages, audio ingestion, LLM-based processing, vector storage, and background tasks.
+A multi-worker WhatsApp bot built with Python. This repository provides a scalable worker-based architecture for handling WhatsApp messages, audio ingestion, LLM-based processing, and background tasks.
 
 ## Features
 
-- Multi-worker processing model for concurrency and reliability
-- Audio ingestion and handling
-- LLM integration and vector utilities
+- Scalable worker architecture (Kafka, RQ, Celery, Huey)
+- Context-aware conversations backed by PostgreSQL
+- Audio transcription and processing
+- LLM integration
 - Redis-backed queueing and idempotency helpers
 - Docker and docker-compose support for easy deployment
 
@@ -36,7 +37,7 @@ Place configuration values in `.env` at the repository root. Example variables u
 python run.py
 
 # start a worker process
-python worker.py
+python -m app.workers.worker
 ```
 
 ### Setup and start (detailed)
@@ -73,7 +74,7 @@ python run.py
 Terminal B (worker process):
 
 ```powershell
-python worker.py
+python -m app.workers.worker
 ```
 
 If you prefer Docker Compose, see the Quick Start (Docker) section above.
@@ -90,22 +91,14 @@ This will build the image(s) and run services as configured in `docker-compose.y
 
 ## Project layout
 
-- `run.py` — project entry for the main service
-- `worker.py` — worker entry that processes background jobs
-- `start.sh` — convenience script for Unix-like systems
+- `run.py` — project entry for the main service (local dev)
+- `start.sh` — convenience script for Unix-like systems and Docker entrypoint
 - `app/` — application package
-  - `main.py` — web / request handlers
-  - `whatsapp.py` — WhatsApp integration helpers
-  - `audio_handler.py` — audio-related processing
-  - `ingest.py` — audio ingestion utilities
-  - `llm.py` — LLM interaction logic
-  - `vector_utils.py` — vector storage and retrieval helpers
-  - `queueing.py` — queue/redis task helpers
-  - `redis_client.py` — redis connection helpers
-  - `razorpay_client.py` — Razorpay integration
-  - `idempotency.py` — idempotency helpers
-  - `models.py` — domain models
-  - `config.py` — configuration loader (reads environment)
+  - `api/` — FastAPI webhook receiver and HTTP entrypoint (`main.py`)
+  - `core/` — core infrastructure (config, queues, idempotency, redis, kafka)
+  - `models/` — domain models and Pydantic schemas (`schemas.py`)
+  - `services/` — business logic and external integrations (LLM, WhatsApp, Razorpay, audio processing, memory, onboarding)
+  - `workers/` — background worker processes (inbound, outbound, dead letter)
 
 ## Configuration
 

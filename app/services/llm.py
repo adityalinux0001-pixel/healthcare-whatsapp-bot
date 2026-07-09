@@ -1,12 +1,11 @@
 import asyncio
 import logging
 import random
-import base64
 import uuid
 import json as _json
 from functools import lru_cache
-from app.config import get_settings
-from app.redis_client import get_redis
+from app.core.config import get_settings
+from app.core.redis_client import get_redis
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
@@ -41,46 +40,7 @@ def _is_transient_gemini_error(exc: Exception) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Queueing + concurrency limiting for Gemini calls
-# ---------------------------------------------------------------------------
-#
-# Every Gemini call in this file (language detection, main reply, follow-up
-# suggestion, summary, vision) ultimately goes through `_call_gemini()`
-# below. It does two things:
-#
-# 1. CONCURRENCY LIMIT — caps how many Gemini requests are in flight at
-#    once, ACROSS ALL WORKER PROCESSES (gemini_max_concurrent_requests).
-#
-#    STEP 2 OF THE MULTI-WORKER MIGRATION: this used to be a plain
-#    `asyncio.Semaphore`, which only limits concurrency *within one
-#    process*. That's exactly wrong once you run N gunicorn workers
-#    (step 4) — each worker would independently allow
-#    gemini_max_concurrent_requests requests through, so the real
-#    ceiling against Gemini becomes N times higher than configured, and
-#    the whole point of this limiter (protecting your Gemini quota tier
-#    from 503/UNAVAILABLE bursts) silently stops working the moment you
-#    add a second worker.
-#
-#    The fix is a distributed semaphore backed by Redis: every worker
-#    acquires/releases the *same* counter over the network instead of an
-#    in-process object. Implementation: a Redis SET holding one member
-#    per currently-held "slot", each with its own short TTL. Acquire =
-#    atomically check the set's size against the limit and add a member
-#    if there's room (done via a Lua script so the check-and-add is a
-#    single atomic operation — no race between two workers both seeing
-#    "room for one more" at once). Release = remove that member.
-#    The per-member TTL is a safety net: if a worker crashes mid-request
-#    without releasing, its slot expires on its own instead of
-#    permanently eating into the limit.
-#
-# 2. RETRY WITH BACKOFF — if Gemini still comes back overloaded
-#    (503/429/504) even after limiting concurrency, the call is retried a
-#    few times with exponential backoff + jitter before finally raising
-#    GeminiUnavailableError. This smooths over brief overload spikes
-#    without dropping the user's message. (Unchanged from before — this
-#    part was already process-independent since it just wraps the single
-#    call this process is making.)
+
 
 _SEMAPHORE_KEY = "wa:gemini:semaphore"
 # Safety-net TTL per held slot — comfortably longer than any real Gemini
@@ -90,11 +50,7 @@ _SEMAPHORE_SLOT_TTL_SECONDS = 120
 # How long a waiter polls before rechecking whether a slot has freed up.
 _SEMAPHORE_POLL_INTERVAL_SECONDS = 0.15
 
-# Lua script: atomically prune expired members (belt-and-braces on top of
-# the per-member TTL, since Redis TTLs apply to whole keys not set
-# members — we simulate per-member expiry with a sorted set instead of a
-# plain set: score = expiry unix timestamp), then, if there's room under
-# the limit, add the new member. Returns 1 if acquired, 0 if full.
+
 _ACQUIRE_SCRIPT = """
 local key = KEYS[1]
 local member = ARGV[1]
@@ -127,7 +83,6 @@ async def _redis_semaphore_acquire(limit: int) -> str:
 
     member = uuid.uuid4().hex
     while True:
-        now = asyncio.get_event_loop().time()
         # Redis wants a real unix-ish timestamp for the score; use
         # server-independent wall clock via Python since we only compare
         # it against values we ourselves wrote.
@@ -173,14 +128,13 @@ async def is_gemini_busy() -> bool:
     """
     settings = get_settings()
     r = get_redis()
-    now = asyncio.get_event_loop().time()
     import time as _time
     wall_now = _time.time()
     # Prune expired slots first so a crashed worker's stale entries don't
     # make the system look busier than it actually is.
     await r.zremrangebyscore(_SEMAPHORE_KEY, "-inf", wall_now)
     current = await r.zcard(_SEMAPHORE_KEY)
-    return current >= settings.gemini_max_concurrent_requests
+    return current >= settings.GEMINI_MAX_CONCURRENT_REQUESTS
 
 
 async def _call_gemini(coro_fn, *, label: str):
@@ -199,7 +153,7 @@ async def _call_gemini(coro_fn, *, label: str):
             logging easy to follow across concurrent users.
     """
     settings = get_settings()
-    limit = settings.gemini_max_concurrent_requests
+    limit = settings.GEMINI_MAX_CONCURRENT_REQUESTS
 
     queued = await is_gemini_busy()
     if queued:
@@ -211,26 +165,26 @@ async def _call_gemini(coro_fn, *, label: str):
             logger.info(f"Gemini[{label}]: dequeued, sending request")
 
         last_exc: Exception | None = None
-        for attempt in range(settings.gemini_max_retries + 1):
+        for attempt in range(settings.GEMINI_MAX_RETRIES + 1):
             try:
                 return await coro_fn()
             except Exception as e:
                 if not _is_transient_gemini_error(e):
                     raise
                 last_exc = e
-                if attempt < settings.gemini_max_retries:
-                    delay = settings.gemini_retry_base_delay_seconds * (2 ** attempt)
+                if attempt < settings.GEMINI_MAX_RETRIES:
+                    delay = settings.GEMINI_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
                     delay += random.uniform(0, delay * 0.25)
                     logger.warning(
                         f"Gemini[{label}]: transient error on attempt "
-                        f"{attempt + 1}/{settings.gemini_max_retries + 1} "
+                        f"{attempt + 1}/{settings.GEMINI_MAX_RETRIES + 1} "
                         f"({e}); retrying in {delay:.1f}s"
                     )
                     await asyncio.sleep(delay)
                 else:
                     logger.warning(
                         f"Gemini[{label}]: still failing after "
-                        f"{settings.gemini_max_retries + 1} attempts ({e}); giving up"
+                        f"{settings.GEMINI_MAX_RETRIES + 1} attempts ({e}); giving up"
                     )
 
         raise last_exc
@@ -350,11 +304,8 @@ async def detect_reply_language(
     LATENCY NOTE: this is still its own small Gemini call (kept isolated
     on purpose — see _detect_reply_language's docstring for why folding it
     into the main prompt caused wrong-language replies). The win is in how
-    the CALLER schedules it: main.py now fires this concurrently with RAG
-    retrieval (asyncio.gather) instead of awaiting it before starting the
-    main LLM call, so its latency is absorbed into the RAG round-trip
-    instead of stacking as a second sequential Gemini round-trip on top of
-    the main reply call.
+    the CALLER schedules it: main.py now fires this concurrently with context
+    retrieval (asyncio.gather) instead of awaiting it sequentially.
     """
     client = _get_client()
     return await _detect_reply_language(client, text, whisper_language)
@@ -530,7 +481,7 @@ def _get_client() -> genai.Client:
     # its underlying HTTP transport/connection pool each time — cache it
     # so connections are reused across requests.
     settings = get_settings()
-    return genai.Client(api_key=settings.gemini_api_key)
+    return genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
 def _strip_leaked_meta_text(reply: str) -> str:
@@ -571,23 +522,12 @@ async def process_image_with_vision(image_bytes: bytes, mime_type: str) -> str:
         String description of the image
     """
     try:
-        settings = get_settings()
         client = _get_client()
         
-        # LATENCY FIX: this description is never shown to the user as-is —
-        # it's only fed back in as input to the main reply call
-        # (get_llm_response), which then writes the actual WhatsApp reply.
-        # The old 5-point "detailed description" prompt made this
-        # intermediate step generate up to 500 tokens before the main
-        # reply call could even start, on every single image message.
-        # A short, plain-facts description is just as useful as input to
-        # the next call and finishes generating far faster.
+
         vision_prompt = """Describe this image in 1-3 short, plain sentences. Specify what it shows, extract any visible text verbatim, and highlight details relevant to health or medicine (e.g., symptoms, food, medication labels, lab reports, activities). Do not include headers, numbered lists, or extrapolation."""
         
-        # Call Gemini Vision API via the async client (client.models.* is
-        # synchronous/blocking — calling it here without a thread offload
-        # froze the entire event loop, i.e. EVERY user's request, for the
-        # full duration of the Gemini call).
+
         response = await _call_gemini(
             lambda: client.aio.models.generate_content(
             model="gemini-2.5-flash-lite",
@@ -596,10 +536,7 @@ async def process_image_with_vision(image_bytes: bytes, mime_type: str) -> str:
                 types.Part(text=vision_prompt)
             ],
             config=types.GenerateContentConfig(
-                # Lowered from 500 -> 150. This is an internal
-                # description, not the user-facing reply — a short,
-                # factual description is enough input for the main reply
-                # call and finishes generating noticeably faster.
+
                 max_output_tokens=150,
                 temperature=0.3,
             )
@@ -681,12 +618,7 @@ async def generate_followup_suggestion(
         bullet_list = "\n".join(f"- {s}" for s in recent_suggestions)
         already_asked = f"\n\n[FOLLOW-UPS ALREADY ASKED RECENTLY — do not repeat these or ask something near-identical]\n{bullet_list}"
 
-    # Detect language from the USER's message, not the assistant's reply —
-    # the reply's wording can drift (e.g. picks up a Hindi/Hinglish word
-    # while still being substantively an English answer), which previously
-    # caused the follow-up suggestion to land in a different language than
-    # what the user actually typed. The suggestion should always mirror the
-    # user's own language, same as the main reply does.
+
     if required_language is not None:
         pass  # reuse caller-provided result — same value detection would produce anyway
     else:
@@ -810,7 +742,7 @@ async def get_llm_response(
             summary/context mixed in, but still better than nothing).
         whisper_language: for voice messages, the language Whisper's STT
             API detected from the audio itself (e.g. "english", "hindi").
-            Passed through to _detect_reply_language so a mis-transcribed
+            Passed through to _detect_reply_language so a miss-transcribed
             script doesn't cause a wrong-language reply.
         required_language: if the caller already knows the target language
             for this turn (e.g. computed once in main.py via
@@ -843,7 +775,7 @@ async def get_llm_response(
     # Build conversation history in Gemini format
     history = []
     if conversation_history:
-        max_msgs = settings.max_history_turns * 2
+        max_msgs = settings.MAX_HISTORY_TURNS * 2
         for msg in conversation_history[-max_msgs:]:
             role = "model" if msg["role"] == "assistant" else msg["role"]
             history.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
@@ -853,12 +785,7 @@ async def get_llm_response(
         model="gemini-2.5-flash-lite",
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
-            # Lowered from 500 -> 220. The system prompt now enforces a
-            # 2-4 sentence default reply; 220 tokens comfortably covers
-            # that (plus headroom for a detailed answer when the user
-            # explicitly asks for one) while cutting generation time for
-            # every reply, and acts as a hard backstop against the model
-            # ignoring the length instruction and running long.
+
             max_output_tokens=220,
             temperature=0.1,
         ),
@@ -973,27 +900,6 @@ Write today's check-in message following the rules exactly.
     return message
 
 
-# ============================================================================
-# PREMIUM PLAN PREGENERATION — one LLM call at onboarding, all 21 days
-# ============================================================================
-#
-# Replaces the old "call Gemini once per day" model (generate_daily_checkin_
-# message above, still kept for backward compatibility / manual use) with a
-# single call made right after onboarding finishes. See app/onboarding.py
-# for the question flow that collects the answers passed in here, and
-# app/daily_checkin.py for the scheduler that now just fetches + sends the
-# pre-written row for the day — zero LLM calls on that path.
-#
-# Category support: PLAN_CATEGORY_PROMPTS holds one system-prompt template
-# per plan category. "weight_loss" is the only one wired up today (it's
-# settings.default_plan_category), but adding "yoga", "bulking", etc. later
-# is just adding another entry here — generate_premium_plan() and everything
-# downstream (schema, scheduler, follow-up capture) is already
-# category-agnostic.
-
-import json as _json
-
-
 PLAN_CATEGORY_PROMPTS: dict[str, str] = {
     "weight_loss": """
 You are a practical health coach building a progressive {total_days}-day WhatsApp weight-loss micro-coaching plan based on the onboarding data below. This provides safe habit nudges, not medical prescriptions.
@@ -1051,8 +957,8 @@ async def generate_premium_plan(
             routine/time available, past attempts — see app/onboarding.py
             for the exact question set).
         category: plan category, e.g. "weight_loss" (see
-            settings.default_plan_category and PLAN_CATEGORY_PROMPTS above).
-        total_days: length of the plan (settings.premium_plan_days).
+            settings.DEFAULT_PLAN_CATEGORY and PLAN_CATEGORY_PROMPTS above).
+        total_days: length of the plan (settings.PREMIUM_PLAN_DAYS).
         required_language: language to write in; defaults to English.
 
     Returns:

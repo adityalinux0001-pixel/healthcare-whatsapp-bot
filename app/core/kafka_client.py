@@ -35,7 +35,7 @@ from typing import Any, Callable, Optional
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
-from app.config import get_settings
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +64,9 @@ def get_producer() -> Producer:
         settings = get_settings()
         _producer = Producer(
             {
-                "bootstrap.servers": settings.kafka_bootstrap_servers,
-                "acks": settings.kafka_producer_acks,
-                # Retry transient broker errors instead of failing the
-                # publish outright — the webhook ack has already been
-                # returned to Meta by this point, so we can afford to
-                # retry here without risking a duplicate delivery from
-                # Meta's side.
+                "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
+                "acks": settings.KAFKA_PRODUCER_ACKS,
+
                 "retries": 5,
                 "retry.backoff.ms": 200,
                 "linger.ms": 20,
@@ -126,7 +122,7 @@ def ensure_topics(topics: list[str], num_partitions: int, replication_factor: in
     this, but it's safe to call either way.
     """
     settings = get_settings()
-    admin = AdminClient({"bootstrap.servers": settings.kafka_bootstrap_servers})
+    admin = AdminClient({"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS})
     new_topics = [
         NewTopic(t, num_partitions=num_partitions, replication_factor=replication_factor)
         for t in topics
@@ -219,9 +215,9 @@ async def run_consumer_loop_async(
     settings = get_settings()
     consumer = Consumer(
         {
-            "bootstrap.servers": settings.kafka_bootstrap_servers,
+            "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
             "group.id": group_id,
-            "auto.offset.reset": settings.kafka_consumer_auto_offset_reset,
+            "auto.offset.reset": settings.KAFKA_CONSUMER_AUTO_OFFSET_RESET,
             "enable.auto.commit": False,
         }
     )
@@ -233,47 +229,13 @@ async def run_consumer_loop_async(
 
     is_async_handler = asyncio.iscoroutinefunction(handle_message)
     semaphore = asyncio.Semaphore(max_concurrent)
-    # Which message KEYS (phone numbers) currently have a task in flight —
-    # gates starting a second task for the same user (ordering guarantee
-    # above).
-    #
-    # THIS USED TO GATE ON msg.partition() INSTEAD OF msg.key(). That was
-    # a real bug, not just an over-cautious choice: with
-    # kafka_num_partitions=6 and the default hash partitioner, two or
-    # more DIFFERENT phone numbers regularly collide onto the same
-    # partition (pigeonhole — 6 buckets, any nontrivial number of active
-    # users). Gating on the partition meant User B's message sat idle
-    # behind User A's entire _handle_incoming() (Gemini calls, DB writes,
-    # sometimes 503-retry backoff pushing 20-40s) whenever they happened
-    # to share a partition — even though they are unrelated users and
-    # Kafka's ordering guarantee never required serializing them against
-    # each other. That's the exact "3rd user's message doesn't show
-    # 'seen' until the first two are done" symptom. Kafka only guarantees
-    # ordering *within* a partition for messages sharing a partition;
-    # what we actually need to preserve is ordering *per key* (per user),
-    # which gating on msg.key() gives us directly and correctly, without
-    # over-serializing unrelated users who happen to collide onto the
-    # same partition.
+
     keys_in_flight: set[bytes] = set()
     in_flight_tasks: set[asyncio.Task] = set()
-    # Tasks report finished (msg, error_or_None) tuples here. Only the
-    # main loop ever reads this queue and only the main loop ever calls
-    # consumer.commit() — that's what keeps all Consumer access on one
-    # logical thread of control.
+
     completed: asyncio.Queue = asyncio.Queue()
 
-    # commit() must still advance strictly in offset order WITHIN a
-    # partition — that part of Kafka's contract doesn't change just
-    # because we now gate concurrency by key instead of by partition.
-    # Two different users' messages can now be in flight on the same
-    # partition at once, and they can finish in either order; if the
-    # later-offset one finishes first we must hold its commit until the
-    # earlier-offset one on that same partition has also completed,
-    # otherwise a crash before the earlier one finishes would skip past
-    # it on restart (auto.offset.reset picks up after the last commit).
-    # finished_offsets[partition] holds offsets that completed
-    # successfully but are still waiting behind an earlier offset on the
-    # same partition.
+
     finished_offsets: dict[int, set[int]] = {}
     # next_offset_to_commit[partition] = the lowest offset on that
     # partition we haven't committed yet — i.e. what we're waiting on.
@@ -317,24 +279,12 @@ async def run_consumer_loop_async(
                     "— NOT committing offset, will be redelivered.",
                     exc_info=error,
                 )
-                # A gap at this offset is intentional here: we do NOT
-                # advance next_offset_to_commit past a failed message, so
-                # every later offset on this partition (even ones that
-                # already finished successfully and are sitting in
-                # finished_offsets) stays uncommitted until this one is
-                # retried and succeeds. That's the same at-least-once
-                # semantics the rest of this codebase relies on
-                # elsewhere (see run_consumer_loop's docstring).
+
                 continue
 
             finished_offsets.setdefault(partition, set()).add(offset)
 
-            # Commit the longest CONTIGUOUS run of successfully finished
-            # offsets starting from next_offset_to_commit[partition].
-            # This is what keeps offset commits in strict per-partition
-            # order even though two different users' messages on the
-            # same partition can now finish in either order (see the
-            # keys_in_flight docstring above for why that's possible).
+
             expected = next_offset_to_commit.get(partition, offset)
             pending = finished_offsets[partition]
             highest_committable = None
@@ -345,18 +295,10 @@ async def run_consumer_loop_async(
             next_offset_to_commit[partition] = expected
 
             if highest_committable is None:
-                # This offset finished, but an earlier offset on the same
-                # partition is still in flight — nothing new to commit
-                # yet; highest_committable will catch up once that
-                # earlier one finishes.
+
                 continue
 
-            # commit() is a blocking librdkafka call, but it's fast
-            # (network round trip, not a Gemini call) and — critically —
-            # runs here on the single consumer-owning coroutine only, so
-            # there's no thread-safety concern running it inline without
-            # to_thread. Keeping it un-threaded also avoids any chance
-            # of a stray overlap with poll() below.
+
             try:
                 consumer.commit(
                     offsets=[TopicPartition(topic, partition, highest_committable + 1)],
@@ -378,19 +320,11 @@ async def run_consumer_loop_async(
             # message for that same user.
             await _drain_completed(block=False)
 
-            # poll() itself is a blocking librdkafka call. It's still
-            # safe to run off-thread via to_thread because, by
-            # construction, nothing else ever touches `consumer`
-            # concurrently with it: commit() only happens in
-            # _drain_completed() calls that happen strictly before or
-            # after this poll() on the same coroutine, never during it.
+
             msg = await asyncio.to_thread(consumer.poll, poll_timeout)
 
             if msg is None:
-                # Nothing new arrived this tick — use the idle moment to
-                # block-wait for at least one in-flight task to finish
-                # (if any), so keys free up promptly instead of only
-                # being noticed on the next poll_timeout tick.
+
                 if in_flight_tasks:
                     await _drain_completed(block=True)
                 continue
@@ -402,20 +336,7 @@ async def run_consumer_loop_async(
 
             key = msg.key()
             if key in keys_in_flight:
-                # This user's previous message is still being handled —
-                # don't start a second task for them (would risk
-                # out-of-order processing for that one user). We haven't
-                # committed the in-flight one yet, so librdkafka will
-                # hand us this same message again on a later poll();
-                # nothing is lost, we just don't act on it yet.
-                #
-                # Note: because commit() advances a partition's offset
-                # strictly in order, if this message is BEHIND another
-                # in-flight message on the same partition but for a
-                # DIFFERENT key, we still can't commit past it here —
-                # but we also don't need to: we simply skip starting a
-                # task for it this tick and let poll() re-offer it once
-                # the blocking key is free, same as before.
+
                 await asyncio.sleep(0.05)
                 continue
 
@@ -456,9 +377,9 @@ def run_consumer_loop(
     settings = get_settings()
     consumer = Consumer(
         {
-            "bootstrap.servers": settings.kafka_bootstrap_servers,
+            "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
             "group.id": group_id,
-            "auto.offset.reset": settings.kafka_consumer_auto_offset_reset,
+            "auto.offset.reset": settings.KAFKA_CONSUMER_AUTO_OFFSET_RESET,
             # Commit offsets ourselves, after successful processing, not
             # automatically in the background — see docstring above.
             "enable.auto.commit": False,

@@ -19,7 +19,7 @@ from functools import lru_cache
 
 import razorpay
 
-from app.config import get_settings
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def _get_client() -> razorpay.Client:
     settings = get_settings()
-    client = razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+    client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
     return client
 
 
@@ -93,12 +93,12 @@ def verify_webhook_signature(request_body: bytes, received_signature: str) -> bo
     constant-time comparison to avoid timing attacks.
     """
     settings = get_settings()
-    if not settings.razorpay_webhook_secret:
+    if not settings.RAZORPAY_WEBHOOK_SECRET:
         logger.error("razorpay_webhook_secret is not configured — rejecting webhook.")
         return False
 
     expected_signature = hmac.new(
-        key=settings.razorpay_webhook_secret.encode("utf-8"),
+        key=settings.RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
         msg=request_body,
         digestmod=hashlib.sha256,
     ).hexdigest()

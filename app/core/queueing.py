@@ -4,7 +4,7 @@ import time
 from typing import Any
 
 from redis import Redis
-from app.config import get_settings
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,6 @@ try:
 except ImportError:
     RedisHuey = None  # type: ignore
 
-QUEUE_NAME = "default"
 JOB_TIMEOUT = 1200
 RESULT_TTL = 0
 
@@ -38,11 +37,11 @@ def _get_settings():
 
 def _get_redis_conn() -> Redis:
     settings = _get_settings()
-    return Redis.from_url(settings.redis_url)
+    return Redis.from_url(settings.REDIS_URL)
 
 
 def _run_handle(raw_msg: dict) -> None:
-    from app.main import _handle_incoming
+    from app.api.main import _handle_incoming
 
     asyncio.run(_handle_incoming(raw_msg))
 
@@ -57,13 +56,13 @@ def get_celery_app() -> Any:
 
     _celery_app = Celery(
         "whatsapp_bot",
-        broker=settings.redis_url,
-        backend=settings.redis_url,
+        broker=settings.REDIS_URL,
+        backend=settings.REDIS_URL,
     )
     _celery_app.conf.task_serializer = "json"
     _celery_app.conf.result_serializer = "json"
     _celery_app.conf.accept_content = ["json"]
-    _celery_app.conf.task_default_queue = settings.queue_name or QUEUE_NAME
+    _celery_app.conf.task_default_queue = settings.QUEUE_NAME
     _celery_app.conf.task_acks_late = True
     _celery_app.conf.worker_prefetch_multiplier = 1
     _celery_app.conf.broker_transport_options = {"visibility_timeout": 3600}
@@ -83,7 +82,7 @@ def get_huey() -> Any:
     if _huey is not None:
         return _huey
 
-    _huey = RedisHuey(settings.queue_name or QUEUE_NAME, url=settings.redis_url)
+    _huey = RedisHuey(settings.QUEUE_NAME, url=settings.REDIS_URL)
 
     @_huey.task(name="app.queueing.process_incoming_huey")
     def process_incoming_huey(message: dict) -> None:
@@ -101,7 +100,7 @@ def _enqueue_rq(raw_msg: dict) -> str:
     settings = _get_settings()
     if Queue is None:
         raise RuntimeError("RQ is not installed")
-    queue = Queue(settings.queue_name or QUEUE_NAME, connection=_get_redis_conn())
+    queue = Queue(settings.QUEUE_NAME, connection=_get_redis_conn())
     job = queue.enqueue(
         process_incoming_job,
         raw_msg,
@@ -116,7 +115,7 @@ def _enqueue_celery(raw_msg: dict) -> str:
     result = celery_app.send_task(
         "app.queueing.process_incoming_celery_job",
         args=[raw_msg],
-        queue=_get_settings().queue_name or QUEUE_NAME,
+        queue=_get_settings().QUEUE_NAME,
     )
     return str(result.id)
 
@@ -160,20 +159,20 @@ def _extract_phone_number(raw_msg: dict) -> str:
 
 
 def _enqueue_kafka(raw_msg: Any) -> str:
-    from app.kafka_client import publish
+    from app.core.kafka_client import publish
 
     settings = _get_settings()
     raw_msg_dict = _to_plain_dict(raw_msg)
     phone_number = _extract_phone_number(raw_msg_dict)
-    publish(settings.kafka_inbound_topic, key=phone_number, value=raw_msg_dict)
+    publish(settings.KAFKA_INBOUND_TOPIC, key=phone_number, value=raw_msg_dict)
     # Kafka doesn't hand back a job id the way RQ/Celery do — the
     # (topic, key) pair is the closest analogue and is useful in logs.
-    return f"{settings.kafka_inbound_topic}:{phone_number}"
+    return f"{settings.KAFKA_INBOUND_TOPIC}:{phone_number}"
 
 
 def _enqueue_once(raw_msg: dict) -> str:
     settings = _get_settings()
-    backend = (settings.queue_backend or "rq").lower()
+    backend = (settings.QUEUE_BACKEND or "rq").lower()
     if backend == "rq":
         return _enqueue_rq(raw_msg)
     if backend == "celery":
@@ -183,16 +182,10 @@ def _enqueue_once(raw_msg: dict) -> str:
     if backend == "kafka":
         return _enqueue_kafka(raw_msg)
 
-    raise ValueError(f"Unsupported queue backend: {settings.queue_backend}")
+    raise ValueError(f"Unsupported queue backend: {settings.QUEUE_BACKEND}")
 
 
-# Retries for a failed enqueue, done inline with backoff, before falling
-# back to the durable dead-letter table. This runs inside a FastAPI
-# BackgroundTasks task, i.e. AFTER the webhook already returned 200 to
-# Meta — retrying here for a second or two is free (it can't cause Meta
-# to time out or redeliver) and absorbs most transient blips (producer
-# still warming up, "Coordinator load in progress", a momentary broker
-# hiccup) without ever needing the dead-letter table at all.
+
 _ENQUEUE_MAX_RETRIES = 3
 _ENQUEUE_BACKOFF_BASE_SECONDS = 0.5
 
@@ -241,12 +234,8 @@ def enqueue_incoming(raw_msg: dict) -> str:
     # instead of letting the exception vanish inside BackgroundTasks.
     failure_reason = f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown"
     try:
-        # Local import, deferred to call time — mirrors the pattern
-        # already used by _run_handle() above for app.main._handle_incoming.
-        # app.main imports enqueue_incoming from this module, so importing
-        # app.main's `memory` singleton at module load here would be
-        # circular; importing it inside the function body is safe.
-        from app.main import memory
+
+        from app.api.main import memory
 
         dead_letter_id = memory.save_dead_letter(
             phone_number=phone_number,
@@ -260,10 +249,7 @@ def enqueue_incoming(raw_msg: dict) -> str:
         )
         return f"dead_letter:{dead_letter_id}"
     except Exception as dl_exc:
-        # Both the queue backend AND Postgres are unreachable. This is
-        # genuinely unrecoverable from inside this process — log loudly
-        # (CRITICAL) so it trips alerting, since there is nowhere
-        # durable left to put the message.
+
         logger.critical(
             f"🔥 enqueue_incoming: message for {phone_number} LOST — both the "
             f"queue backend ({failure_reason}) and the dead-letter DB write "

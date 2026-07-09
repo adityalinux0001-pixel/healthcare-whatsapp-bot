@@ -20,7 +20,7 @@ import asyncio
 import logging
 import sys
 
-from app.config import get_settings
+from app.core.config import get_settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,8 +30,8 @@ logger = logging.getLogger("whatsapp_bot_outbound_worker")
 
 
 async def _handle_outbound_job_async(payload: dict) -> None:
-    from app.outbound_queue import JOB_MARK_AS_READ, JOB_SEND_TEMPLATE, JOB_SEND_TEXT
-    from app.whatsapp import mark_as_read, send_template_message, send_text_message
+    from app.core.outbound_queue import JOB_MARK_AS_READ, JOB_SEND_TEMPLATE, JOB_SEND_TEXT
+    from app.services.whatsapp import mark_as_read, send_template_message, send_text_message
 
     job_type = payload.get("job_type")
 
@@ -44,16 +44,7 @@ async def _handle_outbound_job_async(payload: dict) -> None:
             logger.info(f"✅ Outbound text delivered to {to}: {result.get('messages')}")
         except Exception:
             logger.error(f"❌ Outbound text send failed for {to}", exc_info=True)
-            # Re-raise so kafka_client's consumer loop does NOT commit the
-            # offset — this job will be redelivered and retried rather
-            # than silently dropped. WhatsApp send calls are not
-            # inherently idempotent (a retry could double-send a
-            # message on a transient network error even though Meta's
-            # own API call actually succeeded) — an at-least-once
-            # outbound queue is a deliberate tradeoff toward "make sure
-            # the user gets their reply" over "never possibly duplicate
-            # a message". Add your own dedupe key here if double-sends
-            # become a real problem in practice.
+
             raise
 
     elif job_type == JOB_SEND_TEMPLATE:
@@ -83,31 +74,22 @@ async def _handle_outbound_job_async(payload: dict) -> None:
 
 def main() -> None:
     settings = get_settings()
-    backend = (settings.queue_backend or "rq").lower()
+    backend = (settings.QUEUE_BACKEND or "rq").lower()
 
     if backend != "kafka":
         logger.error(
             f"outbound_worker.py only applies when QUEUE_BACKEND=kafka "
-            f"(currently '{settings.queue_backend}'). Nothing to consume — exiting."
+            f"(currently '{settings.QUEUE_BACKEND}'). Nothing to consume — exiting."
         )
         sys.exit(1)
 
-    from app.kafka_client import ensure_topics, run_consumer_loop
+    from app.core.kafka_client import ensure_topics, run_consumer_loop
 
     ensure_topics(
-        [settings.kafka_outbound_topic], num_partitions=settings.kafka_num_partitions
+        [settings.KAFKA_OUTBOUND_TOPIC], num_partitions=settings.KAFKA_NUM_PARTITIONS
     )
 
-    # IMPORTANT: one persistent event loop for the whole process, not a
-    # fresh asyncio.run() per message. app/whatsapp.py's _client() caches
-    # a single module-level httpx.AsyncClient the first time it's used —
-    # that client (and its underlying connections) is bound to whichever
-    # event loop was active when it was created. asyncio.run() tears the
-    # loop down after every single message, so the SECOND message would
-    # try to reuse a client bound to an already-closed loop and crash
-    # with "Event loop is closed" / "attached to a different loop" —
-    # exactly the bug hit on the inbound worker side for the same reason
-    # (see worker.py's matching comment for the full explanation).
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -117,8 +99,8 @@ def main() -> None:
     logger.info("Starting Kafka outbound worker for WhatsApp bot")
     try:
         run_consumer_loop(
-            topic=settings.kafka_outbound_topic,
-            group_id=settings.kafka_outbound_group_id,
+            topic=settings.KAFKA_OUTBOUND_TOPIC,
+            group_id=settings.KAFKA_OUTBOUND_GROUP_ID,
             handle_message=_handle_outbound_message,
         )
     finally:

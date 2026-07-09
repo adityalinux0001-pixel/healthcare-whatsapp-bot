@@ -24,7 +24,7 @@ to move it, in order of how much they matter:
 """
 import logging
 
-from app.redis_client import get_redis
+from app.core.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 

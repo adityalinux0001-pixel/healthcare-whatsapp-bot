@@ -41,7 +41,7 @@ import logging
 import sys
 import time
 
-from app.config import get_settings
+from app.core.config import get_settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,24 +53,15 @@ logger = logging.getLogger("dead_letter_worker")
 # How often to check for pending dead-lettered messages.
 POLL_INTERVAL_SECONDS = 30
 
-# How many pending rows to attempt per cycle. Kept small on purpose —
-# this worker is a safety net for rare failures, not a bulk pipeline; if
-# this number is regularly maxed out, that's a signal the real queue
-# backend is unhealthy and needs attention, not a reason to raise the
-# batch size.
+
 BATCH_SIZE = 50
 
-# After this many total attempts (see dead_letter_messages.attempts,
-# incremented both on the original enqueue_incoming failures AND on
-# replay failures below), stop auto-retrying and mark the row
-# failed_permanently so an operator investigates instead of it silently
-# retrying forever against a message that can never succeed (e.g.
-# malformed payload).
+
 MAX_TOTAL_ATTEMPTS = 10
 
 
 def _replay_one(memory, row: dict) -> None:
-    from app.queueing import enqueue_incoming
+    from app.core.queueing import enqueue_incoming
 
     dead_letter_id = row["id"]
     phone_number = row["phone_number"]
@@ -87,11 +78,7 @@ def _replay_one(memory, row: dict) -> None:
         return
 
     try:
-        # enqueue_incoming has its own retry loop internally too, so this
-        # single call already gets a few attempts against the queue
-        # backend before falling through to re-dead-lettering (which
-        # save_dead_letter() correctly treats as "same pending row, bump
-        # attempts" rather than creating a duplicate).
+
         job_ref = enqueue_incoming(payload)
         if job_ref.startswith("dead_letter:"):
             # enqueue_incoming re-dead-lettered it again (still failing).
@@ -120,7 +107,7 @@ def _replay_one(memory, row: dict) -> None:
 
 
 def main() -> None:
-    from app.main import memory  # reuses the app's Postgres connection pool
+    from app.api.main import memory  # reuses the app's Postgres connection pool
 
     settings = get_settings()
     logger.info(
@@ -128,7 +115,7 @@ def main() -> None:
         "queue_backend=%s",
         POLL_INTERVAL_SECONDS,
         BATCH_SIZE,
-        settings.queue_backend,
+        settings.QUEUE_BACKEND,
     )
 
     while True:

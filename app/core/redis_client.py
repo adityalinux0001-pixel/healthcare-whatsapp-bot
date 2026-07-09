@@ -30,19 +30,16 @@ _redis_client: "redis.Redis | None" = None
 def get_redis() -> "redis.Redis":
     global _redis_client
     if _redis_client is None:
-        from app.config import get_settings
+        from app.core.config import get_settings
         settings = get_settings()
         _redis_client = redis.from_url(
-            settings.redis_url,
+            settings.REDIS_URL,
             decode_responses=True,
-            # Fail fast rather than hanging a request indefinitely if
-            # Redis itself is down — better to surface an error than to
-            # silently stall the whole webhook pipeline behind a dead
-            # connection.
+
             socket_connect_timeout=5,
             socket_timeout=5,
         )
-        logger.info(f"Redis client created for {_redis_url_safe(settings.redis_url)}")
+        logger.info(f"Redis client created for {_redis_url_safe(settings.REDIS_URL)}")
     return _redis_client
 
 

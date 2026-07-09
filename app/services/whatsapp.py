@@ -6,16 +6,13 @@ Handles sending voice messages and audio responses
 import logging
 import json
 import httpx
-from app.config import get_settings
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://graph.facebook.com/v25.0"
 
-# Reuse a single pooled/keep-alive HTTP client instead of opening a brand new
-# TCP+TLS connection (via `async with httpx.AsyncClient() as client:`) on
-# every single WhatsApp API call. Handshake overhead was adding real,
-# avoidable latency to every outbound message/read-receipt/upload.
+
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -43,7 +40,7 @@ async def send_text_message(to: str, text: str, reply_to: str = None) -> dict:
     settings = get_settings()
     
     headers = {
-        "Authorization": f"Bearer {settings.whatsapp_token}",
+        "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
     }
     
@@ -59,7 +56,7 @@ async def send_text_message(to: str, text: str, reply_to: str = None) -> dict:
         payload["context"] = {"message_id": reply_to}
     
     try:
-        url = f"{BASE_URL}/{settings.phone_number_id}/messages"
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
         resp = await _client().post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
 
@@ -106,7 +103,7 @@ async def send_audio_message(
         
         # Step 2: Send audio message with the media_id
         headers = {
-            "Authorization": f"Bearer {settings.whatsapp_token}",
+            "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
             "Content-Type": "application/json",
         }
         
@@ -124,7 +121,7 @@ async def send_audio_message(
         if reply_to:
             payload["context"] = {"message_id": reply_to}
         
-        url = f"{BASE_URL}/{settings.phone_number_id}/messages"
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
         resp = await _client().post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
 
@@ -159,7 +156,7 @@ async def _upload_media(
     settings = get_settings()
     
     headers = {
-        "Authorization": f"Bearer {settings.whatsapp_token}",
+        "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
     }
     
     files = {
@@ -168,7 +165,7 @@ async def _upload_media(
     }
     
     try:
-        url = f"{BASE_URL}/{settings.phone_number_id}/media"
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/media"
         resp = await _client().post(url, headers=headers, files=files, timeout=60)
         resp.raise_for_status()
 
@@ -217,7 +214,7 @@ async def send_document_message(
         
         # Send document message
         headers = {
-            "Authorization": f"Bearer {settings.whatsapp_token}",
+            "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
             "Content-Type": "application/json",
         }
         
@@ -238,7 +235,7 @@ async def send_document_message(
         if reply_to:
             payload["context"] = {"message_id": reply_to}
         
-        url = f"{BASE_URL}/{settings.phone_number_id}/messages"
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
         resp = await _client().post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
 
@@ -266,7 +263,7 @@ async def send_template_message(to: str, template_name: str, params: list = None
     settings = get_settings()
     
     headers = {
-        "Authorization": f"Bearer {settings.whatsapp_token}",
+        "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
     }
     
@@ -281,7 +278,7 @@ async def send_template_message(to: str, template_name: str, params: list = None
         payload["template"]["parameters"] = {"body": {"parameters": [{"type": "text", "text": p} for p in params]}}
     
     try:
-        url = f"{BASE_URL}/{settings.phone_number_id}/messages"
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
         resp = await _client().post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
 
@@ -310,7 +307,7 @@ async def mark_as_read(message_id: str, show_typing: bool = False) -> dict:
     settings = get_settings()
     
     headers = {
-        "Authorization": f"Bearer {settings.whatsapp_token}",
+        "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
     }
     
@@ -324,7 +321,7 @@ async def mark_as_read(message_id: str, show_typing: bool = False) -> dict:
         payload["typing_indicator"] = {"type": "text"}
     
     try:
-        url = f"{BASE_URL}/{settings.phone_number_id}/messages"
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
         resp = await _client().post(url, json=payload, headers=headers, timeout=15)
         resp.raise_for_status()
         return resp.json()
@@ -338,14 +335,14 @@ async def verify_token_valid() -> dict:
     settings = get_settings()
     
     headers = {
-        "Authorization": f"Bearer {settings.whatsapp_token}",
+        "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
     }
     
     try:
-        url = f"{BASE_URL}/{settings.phone_number_id}"
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}"
         resp = await _client().get(url, headers=headers, timeout=15)
         resp.raise_for_status()
-        return {"valid": True, "phone_number_id": settings.phone_number_id}
+        return {"valid": True, "phone_number_id": settings.PHONE_NUMBER_ID}
     except Exception as e:
         logger.error(f"Token verification failed: {e}")
         return {"valid": False, "error": str(e)}

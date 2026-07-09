@@ -33,26 +33,17 @@ import asyncio
 import logging
 from typing import Optional
 
-from app.config import get_settings
-from app.memory import ConversationMemory
-from app.llm import generate_premium_plan, detect_reply_language, GeminiUnavailableError
-from app.whatsapp import send_text_message
+from app.core.config import get_settings
+from app.services.memory import ConversationMemory
+from app.services.llm import generate_premium_plan, detect_reply_language, GeminiUnavailableError
+from app.services.whatsapp import send_text_message
 
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
 
-# Each question is (key, prompt_text). `key` is the field name stored in
-# onboarding_sessions.answers and later passed straight into the plan
-# generation prompt. Order matters — this is the order asked.
-#
-# 7 questions chosen to give the LLM everything needed to personalize a
-# full multi-week plan in one shot: sizing (1), ambition (2), constraints
-# that touch every single day's content (3, 5), how hard it can push (4),
-# scheduling realism (6), and what to avoid repeating (7, optional-feel but
-# still asked so the plan doesn't recommend something they already know
-# doesn't work for them).
+
 QUESTIONS_BY_CATEGORY: dict[str, list[tuple[str, str]]] = {
     "weight_loss": [
         (
@@ -105,12 +96,7 @@ def _questions_for(category: str) -> list[tuple[str, str]]:
     return QUESTIONS_BY_CATEGORY.get(category, QUESTIONS_BY_CATEGORY["weight_loss"])
 
 
-# IST is UTC+5:30. Most of this bot's users reply in local (India) time
-# when asked "what time works for you", so we assume IST unless the user
-# explicitly says UTC/GMT. This is a best-effort parse for a free-text
-# WhatsApp reply, not a full NLP time parser — falls back to
-# settings.daily_checkin_hour_utc (see app/config.py) if we can't
-# confidently parse an hour.
+
 _IST_OFFSET_HOURS = 5.5
 
 
@@ -171,7 +157,7 @@ async def start_onboarding(
     this right after memory.activate_subscription(...) succeeds (see the
     /razorpay/webhook handler in app/main.py).
     """
-    category = category or settings.default_plan_category
+    category = category or settings.DEFAULT_PLAN_CATEGORY
     questions = _questions_for(category)
 
     await asyncio.to_thread(memory.start_onboarding_session, phone_number, category)
@@ -179,7 +165,7 @@ async def start_onboarding(
     intro = (
         f"🎉 You're all set on the {category.replace('_', ' ')} plan!\n\n"
         f"Just {len(questions)} quick questions so I can personalize your "
-        f"{settings.premium_plan_days}-day plan, then I'll get it ready for you."
+        f"{settings.PREMIUM_PLAN_DAYS}-day plan, then I'll get it ready for you."
     )
     await send_text_message(phone_number, intro)
     await asyncio.to_thread(
@@ -206,12 +192,12 @@ async def _finish_onboarding_and_generate_plan(
     """
     session = await asyncio.to_thread(memory.mark_onboarding_complete, phone_number)
     answers = session.get("answers", {}) or {}
-    category = session.get("category") or settings.default_plan_category
+    category = session.get("category") or settings.DEFAULT_PLAN_CATEGORY
 
     raw_time_answer = answers.get("preferred_checkin_time", "")
     preferred_hour_utc = _parse_preferred_hour_to_utc(raw_time_answer) if raw_time_answer else None
     if preferred_hour_utc is None:
-        preferred_hour_utc = settings.daily_checkin_hour_utc
+        preferred_hour_utc = settings.DAILY_CHECKIN_HOUR_UTC
         logger.info(
             f"Couldn't parse preferred check-in time '{raw_time_answer}' for "
             f"{phone_number} - falling back to default hour {preferred_hour_utc}:00 UTC."
@@ -221,7 +207,7 @@ async def _finish_onboarding_and_generate_plan(
     await send_text_message(
         phone_number,
         "Perfect, thank you! 🙏 Give me a moment while I put together your "
-        f"full {settings.premium_plan_days}-day plan...",
+        f"full {settings.PREMIUM_PLAN_DAYS}-day plan...",
     )
 
     context_text = await asyncio.to_thread(memory.get_conversation_context, phone_number, limit=5)
@@ -233,7 +219,7 @@ async def _finish_onboarding_and_generate_plan(
         days = await generate_premium_plan(
             onboarding_answers=answers,
             category=category,
-            total_days=settings.premium_plan_days,
+            total_days=settings.PREMIUM_PLAN_DAYS,
             required_language=required_language,
         )
     except GeminiUnavailableError:
@@ -256,7 +242,7 @@ async def _finish_onboarding_and_generate_plan(
     await asyncio.to_thread(memory.save_premium_plan, phone_number, category, days)
 
     confirm = (
-        f"✅ Your personalized {settings.premium_plan_days}-day plan is ready!\n\n"
+        f"✅ Your personalized {settings.PREMIUM_PLAN_DAYS}-day plan is ready!\n\n"
         f"Day 1 is coming up right now 👇 and then one message per day, every day "
         f"around your chosen time. I'll also check in with a quick question after "
         f"each one — just reply whenever you can 💪"
@@ -266,10 +252,7 @@ async def _finish_onboarding_and_generate_plan(
         memory.save_message, phone_number, "assistant", confirm, message_type="text"
     )
 
-    # Send Day 1 IMMEDIATELY instead of waiting for the scheduler's next
-    # run - this is what was missing before: onboarding used to end on a
-    # generic "plan is ready" message with no actual Day 1 content until
-    # the scheduled job next fired (up to ~24h later).
+
     await _send_plan_day_now(memory, phone_number, day_number=1)
 
 
@@ -293,7 +276,7 @@ async def _send_plan_day_now(
         )
         return
 
-    header = f"*Day {day_number} of {settings.premium_plan_days}* 🗓️\n\n"
+    header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
     message = header + plan_day["message_text"]
     followup_question = plan_day.get("followup_question")
 
@@ -302,7 +285,7 @@ async def _send_plan_day_now(
     await asyncio.to_thread(
         memory.save_message, phone_number, "assistant", message, message_type="text"
     )
-    logger.info(f"✅ Sent day {day_number}/{settings.premium_plan_days} immediately to {phone_number}")
+    logger.info(f"✅ Sent day {day_number}/{settings.PREMIUM_PLAN_DAYS} immediately to {phone_number}")
 
     if followup_question:
         await send_text_message(phone_number, followup_question)

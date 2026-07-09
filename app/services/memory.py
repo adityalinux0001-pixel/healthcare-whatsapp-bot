@@ -41,26 +41,18 @@ class ConversationMemory:
                  audio_dir: str = "audio_storage",
                  pool_min_size: int = 1,
                  pool_max_size: int = 5):
-        from app.config import get_settings
+        from app.core.config import get_settings
         settings = get_settings()
 
-        self.database_url = database_url or settings.database_url
+        self.database_url = database_url or settings.DATABASE_URL
 
-        # Audio files still live on local disk (or a mounted volume) —
-        # only the structured data moved to Postgres. If you later run
-        # multiple app *hosts* (not just multiple workers on one host),
-        # this directory needs to be a shared volume/object store; that's
-        # out of scope for this step.
+
         self.audio_dir = self._resolve_path(audio_dir)
         os.makedirs(self.audio_dir, exist_ok=True)
 
         logger.info(f"ConversationMemory connecting to Postgres: {self._safe_url()}")
 
-        # A connection pool (not one connection) because this object is
-        # shared across every request in a worker process; psycopg
-        # connections aren't safe to use concurrently from multiple
-        # threads at once, so each asyncio.to_thread call borrows its own
-        # connection from the pool for the duration of that call.
+
         self.pool = ConnectionPool(
             conninfo=self.database_url,
             min_size=pool_min_size,
@@ -130,21 +122,13 @@ class ConversationMemory:
                 )
             ''')
 
-            # Migration for existing installs: which premium plan category
-            # this user is on ('weight_loss', 'yoga', 'bulking', ...).
-            # Defaults to settings.default_plan_category at the point the
-            # column is added; new rows get the DEFAULT below unless
-            # onboarding explicitly sets something else.
+
             cur.execute('''
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'weight_loss'
             ''')
 
-            # Migration: user's preferred hour (0-23, UTC) for daily
-            # check-ins, collected once during onboarding (see
-            # app/onboarding.py's extra "what time works for you" question).
-            # NULL means "not asked yet / use settings.daily_checkin_hour_utc
-            # default" — see app/daily_checkin.py's scheduler loop.
+
             cur.execute('''
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS preferred_checkin_hour_utc INTEGER
@@ -170,12 +154,7 @@ class ConversationMemory:
                 ON chat_history(phone_number, timestamp DESC)
             ''')
 
-            # NOTE: a processed_messages table used to live here too. It
-            # has moved to Redis (step 3, see app/idempotency.py) because
-            # it needs a cheap atomic check-and-set under load and a
-            # built-in TTL, both of which Redis gives for free — Postgres
-            # would need an extra cron/job to prune it, like the old
-            # prune_old_processed_messages() did.
+
 
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS followup_suggestions (
@@ -202,10 +181,7 @@ class ConversationMemory:
                     paid_at TIMESTAMPTZ
                 )
             ''')
-            # Back-compat: add short_url to any payment_links table created
-            # before this column existed. IF NOT EXISTS makes this a no-op
-            # on fresh databases where the CREATE TABLE above already
-            # included it.
+
             cur.execute('''
                 ALTER TABLE payment_links ADD COLUMN IF NOT EXISTS short_url TEXT
             ''')
@@ -226,19 +202,13 @@ class ConversationMemory:
                 )
             ''')
 
-            # Migration for existing installs created before this column
-            # existed — CREATE TABLE IF NOT EXISTS above is a no-op on an
-            # already-existing table, so the column has to be added
-            # separately for anyone upgrading from an older version.
+
             cur.execute('''
                 ALTER TABLE subscriptions
                 ADD COLUMN IF NOT EXISTS expiry_notified BOOLEAN NOT NULL DEFAULT FALSE
             ''')
 
-            # Tracks the daily premium check-in messages sent as part of
-            # the 21-day (configurable) plan — one row per day actually
-            # sent, so the scheduled job knows which day number a user is
-            # on and never double-sends for the same calendar day.
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS daily_checkins (
                     id BIGSERIAL PRIMARY KEY,
@@ -253,16 +223,7 @@ class ConversationMemory:
                 ON daily_checkins(phone_number, sent_at DESC)
             ''')
 
-            # Tracks the CURRENT symptom-intake conversation for a user —
-            # how many short intake questions have been asked so far for
-            # whatever complaint is being discussed right now. This is
-            # deterministic, code-level state: we do NOT trust the LLM to
-            # count/remember how many questions it has already asked, since
-            # that proved unreliable in practice (it kept looping /
-            # repeating questions instead of concluding). One row per
-            # phone_number; reset (question_count -> 0, started fresh)
-            # whenever a new symptom/complaint is detected, or after the
-            # intake session naturally times out.
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS symptom_sessions (
                     phone_number TEXT PRIMARY KEY,
@@ -272,24 +233,7 @@ class ConversationMemory:
                 )
             ''')
 
-            # ----------------------------------------------------------------
-            # PREMIUM PLAN PREGENERATION
-            # ----------------------------------------------------------------
-            # One row per (user, day_number) for the ENTIRE plan, written all
-            # at once right after onboarding finishes (one LLM call — see
-            # app/llm.py::generate_premium_plan). The daily scheduler
-            # (app/daily_checkin.py) does zero LLM calls: it just reads the
-            # row for today's day_number and sends message_text. sent_at
-            # stays NULL until the scheduler actually sends that day, which
-            # both tells the scheduler which day is next AND lets a human
-            # QA all 21 messages before any of them go out.
-            #
-            # followup_question is generated in the same LLM call and asked
-            # the SAME DAY right after message_text is sent. followup_answer
-            # /followup_answered_at are filled in later by the normal
-            # webhook flow when the user replies — this is logging only in
-            # the current design: it does NOT regenerate or alter any other
-            # day's message_text.
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS premium_plans (
                     id BIGSERIAL PRIMARY KEY,
@@ -323,15 +267,7 @@ class ConversationMemory:
                 WHERE awaiting_followup = TRUE
             ''')
 
-            # ----------------------------------------------------------------
-            # ONBOARDING (the short question flow run once, right after
-            # subscribe, before the single plan-generation LLM call)
-            # ----------------------------------------------------------------
-            # One row per user's IN-PROGRESS onboarding. answers accumulates
-            # as JSONB while question_index advances; once the last question
-            # is answered, app/onboarding.py triggers plan generation and
-            # this row can be left as a completed record (is_complete=TRUE)
-            # or cleared — kept here for audit/debugging.
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS onboarding_sessions (
                     phone_number TEXT PRIMARY KEY,
@@ -344,16 +280,7 @@ class ConversationMemory:
                 )
             ''')
 
-            # Durable fallback for inbound messages that failed to reach
-            # Kafka (or whichever queue backend is active) after the
-            # webhook already ack'd 200 to Meta. Without this table, a
-            # publish() failure inside a FastAPI BackgroundTasks job is
-            # unrecoverable — no exception surfaces anywhere, no retry,
-            # no record the message ever existed. This table is the
-            # "durable record of the failure" — at minimum we can alert
-            # on non-empty pending rows, and app/dead_letter_worker.py
-            # (or an on-demand replay) can re-run enqueue_incoming for
-            # each row later.
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS dead_letter_messages (
                     id BIGSERIAL PRIMARY KEY,
@@ -1080,16 +1007,7 @@ class ConversationMemory:
                 started_at = started_at.replace(tzinfo=None)
             return (datetime.utcnow() - started_at).total_seconds()
 
-    # ------------------------------------------------------------------
-    # Dead-letter queue (failed inbound-message enqueues)
-    # ------------------------------------------------------------------
-    #
-    # Called from app/queueing.py's enqueue_incoming() whenever publishing
-    # to the active queue backend (Kafka/RQ/Celery/Huey) raises. This is
-    # the durable fallback: instead of a message silently vanishing inside
-    # a swallowed BackgroundTasks exception, it lands here with the full
-    # original payload, so it can be inspected, alerted on, and replayed
-    # without asking the user to resend anything.
+
 
     def save_dead_letter(
         self, phone_number: str, payload: dict, failure_reason: str,

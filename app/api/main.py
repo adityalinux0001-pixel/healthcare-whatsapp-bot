@@ -18,20 +18,20 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import PlainTextResponse
-from app.config import get_settings
-from app.models import (
+from app.core.config import get_settings
+from app.models.schemas import (
     WebhookPayload,
     IncomingMessage,
     TestMessageRequest,
     TestTemplateRequest,
 )
-from app.whatsapp import (
+from app.services.whatsapp import (
     send_text_message,
     send_template_message,
     mark_as_read,
     verify_token_valid,
 )
-from app.llm import (
+from app.services.llm import (
     get_llm_response,
     get_summary_response,
     process_image_with_vision,
@@ -41,17 +41,17 @@ from app.llm import (
     is_gemini_busy,
     GeminiUnavailableError,
 )
-from app.memory import ConversationMemory
-from app.idempotency import try_mark_message_processed
-from app.audio_handler import (
+from app.services.memory import ConversationMemory
+from app.core.idempotency import try_mark_message_processed
+from app.services.audio_handler import (
     transcribe_audio, 
     get_available_models,
     get_model_info,
     get_audio_duration_seconds,
 )
-from app.queueing import enqueue_incoming
-from app.razorpay_client import create_payment_link, verify_webhook_signature
-from app.onboarding import start_onboarding, handle_onboarding_reply
+from app.core.queueing import enqueue_incoming
+from app.services.razorpay_client import create_payment_link, verify_webhook_signature
+from app.services.onboarding import start_onboarding, handle_onboarding_reply
 
 # Voice notes longer than this are rejected outright — client requirement.
 MAX_AUDIO_DURATION_SECONDS = 30
@@ -59,7 +59,7 @@ MAX_AUDIO_DURATION_SECONDS = 30
 # Logging
 settings = get_settings()
 logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
@@ -67,18 +67,12 @@ logger = logging.getLogger("whatsapp_bot_enhanced")
 
 # Initialize Postgres-backed conversation memory (step 1)
 memory = ConversationMemory(
-    database_url=settings.database_url,
-    pool_min_size=settings.db_pool_min_size,
-    pool_max_size=settings.db_pool_max_size,
+    database_url=settings.DATABASE_URL,
+    pool_min_size=settings.DB_POOL_MIN_SIZE,
+    pool_max_size=settings.DB_POOL_MAX_SIZE,
 )
 
-# Ignore any incoming message older than this many seconds by the time we
-# actually get to process it. WhatsApp can redeliver a webhook for a
-# message hours after it was first sent (e.g. after our server was slow,
-# down, or restarted) — if we didn't check this, that redelivery would
-# run through the whole pipeline as if it were a live, brand-new query
-# and could fire a "Gemini unavailable" reply long after the user's
-# conversation had already ended.
+
 _MAX_MESSAGE_AGE_SECONDS = 120
 
 # App
@@ -86,14 +80,14 @@ _MAX_MESSAGE_AGE_SECONDS = 120
 async def lifespan(app: FastAPI):
     logger.info("=" * 60)
     logger.info("AI Health Assistant — WhatsApp Bot")
-    logger.info(f"Phone Number ID : {settings.phone_number_id}")
+    logger.info(f"Phone Number ID : {settings.PHONE_NUMBER_ID}")
     logger.info(f"Database        : {memory._safe_url()}")
     logger.info(f"Audio Storage   : {memory.audio_dir}")
     logger.info("Swagger UI      : http://localhost:8000/docs")
     logger.info("=" * 60)
 
     try:
-        from app.redis_client import get_redis
+        from app.core.redis_client import get_redis
         await get_redis().ping()
         logger.info("✅ Redis connected")
     except Exception as e:
@@ -101,11 +95,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: release the Postgres connection pool cleanly rather than
-    # letting connections dangle when a worker process exits (matters
-    # more now than under SQLite, since a lingering connection here holds
-    # a slot against Postgres's max_connections until the OS notices the
-    # socket is dead).
+
     try:
         memory.pool.close()
     except Exception:
@@ -123,7 +113,7 @@ async def verify_webhook(
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
     logger.info(f"Webhook verify — mode={hub_mode} token={hub_verify_token}")
-    if hub_mode == "subscribe" and hub_verify_token == settings.verify_token:
+    if hub_mode == "subscribe" and hub_verify_token == settings.VERIFY_TOKEN:
         logger.info("Webhook verified")
         return PlainTextResponse(content=hub_challenge)
     logger.warning("Webhook verification failed")
@@ -149,7 +139,7 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
     """Download media from WhatsApp using media ID."""
     try:
         url = f"https://graph.facebook.com/v25.0/{media_id}"
-        headers = {"Authorization": f"Bearer {settings.whatsapp_token}"}
+        headers = {"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}"}
         client = _media_client()
 
         resp = await client.get(url, headers=headers, timeout=15)
@@ -167,38 +157,16 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
 
 
 def _looks_like_a_question(reply: str) -> bool:
-    """
-    Deterministic, code-level check for "is this reply already a short
-    intake-style question?" — used both to (a) hard-skip the follow-up
-    system so it never adds a second question on top of one the main
-    reply already asked, and (b) drive the symptom-intake question
-    counter in generate_context_aware_response(). Relying on an LLM call
-    to self-report "was my last reply a question" was unreliable in
-    practice and caused duplicate/looping questions in symptom-intake
-    conversations — this is a simple, deterministic text check instead.
-
-    Heuristic: short (intake questions are always brief per the system
-    prompt) AND ends with a question mark. A longer reply ending in "?"
-    (e.g. a full explanation that happens to end with a rhetorical
-    question) is intentionally NOT caught by this — it only targets the
-    short, single-question intake style.
-    """
     text = reply.strip()
     if not text:
         return False
 
-    # Consider only the first line for the length/"is this a question"
-    # check — poll-style numbered options (e.g. "1. Around 100°F") may
-    # follow on later lines and shouldn't affect this.
     first_line = text.splitlines()[0].strip()
 
     if not first_line.endswith("?"):
         return False
 
-    # Intake questions are short by design (system prompt: 2-8 words,
-    # occasionally a short clause more). Generous upper bound in
-    # characters to stay robust across languages/scripts without needing
-    # word-splitting logic.
+
     return len(first_line) <= 120
 
 
@@ -227,15 +195,7 @@ async def generate_context_aware_response(
         generate_followup_suggestion() instead of having that function
         re-detect the same deterministic result via a second Gemini call.
     """
-    # Run local DB lookups AND language detection concurrently — they're
-    # independent of each other, so no need to do either sequentially.
-    #
-    # NOTE: memory.* methods use blocking psycopg calls. Without
-    # asyncio.to_thread here, calling them directly inside these
-    # coroutines would run synchronously on the event loop, defeating the
-    # whole point of asyncio.gather — they'd effectively execute one after
-    # another (and block every other in-flight request) instead of really
-    # running concurrently with language detection.
+
     async def _get_context():
         return await asyncio.to_thread(memory.get_conversation_context, phone_number, limit=5)
 
@@ -250,12 +210,9 @@ async def generate_context_aware_response(
     )
     customer_summary = customer_data.get("summary", "")
 
-    # ------------------------------------------------------------------
-    # Deterministic symptom-intake question cap (code-level, not left to
-    # the LLM's judgment — see symptom_intake_max_questions in config.py).
-    # ------------------------------------------------------------------
+
     session_age = await asyncio.to_thread(memory.get_symptom_session_age_seconds, phone_number)
-    if session_age is not None and session_age > settings.symptom_intake_session_timeout_seconds:
+    if session_age is not None and session_age > settings.SYMPTOM_INTAKE_SESSION_TIMEOUT_SECONDS:
         # Stale session (user went quiet for a long time) — treat this as
         # a fresh conversation instead of continuing to count against an
         # abandoned symptom discussion.
@@ -264,32 +221,9 @@ async def generate_context_aware_response(
     else:
         questions_asked_so_far = await asyncio.to_thread(memory.get_symptom_question_count, phone_number)
 
-    intake_limit_reached = questions_asked_so_far >= settings.symptom_intake_max_questions
+    intake_limit_reached = questions_asked_so_far >= settings.SYMPTOM_INTAKE_MAX_QUESTIONS
 
-    # ------------------------------------------------------------------
-    # Deterministic-ish topic-switch guard: if the CURRENT message is
-    # actually about the premium plan/payment (not a symptom), do not let
-    # the model fall back into the symptom-intake question loop it may
-    # still be mid-way through. Without this, a user switching topics
-    # mid-intake (e.g. fever questions -> "what about the premium plan")
-    # sees the bot ignore their actual message and keep asking symptom
-    # questions, because the LLM re-infers intent each turn from noisy
-    # history and defaults back to whatever intake state it was last in.
-    #
-    # This used to be a `keyword in text.lower()` check against a big
-    # static keyword list (_PREMIUM_INTEREST_KEYWORDS). That broke in
-    # practice: a message like "vegetarian diet for tuberculosis" matched
-    # "diet" and got treated as premium interest even though it has
-    # nothing to do with the plan, and a topic-correction like "no,
-    # tuberculosis diet, not weight loss" still matched "weight loss"
-    # despite the user explicitly declining that topic. Keyword
-    # substring-matching has no concept of negation or context, so it
-    # can't tell those apart. Replaced with classify_premium_intent(), an
-    # isolated small-model call (same pattern as detect_reply_language)
-    # that looks at recent context + the current message and returns a
-    # real premium_related/explicit_request decision instead of a naive
-    # substring match.
-    # ------------------------------------------------------------------
+
     topic_switch_instruction = ""
     if not intake_limit_reached:
         premium_intent = await classify_premium_intent(user_message, recent_context=context_text)
@@ -302,12 +236,7 @@ HARD OVERRIDE — READ FIRST: The user's CURRENT message is about the premium pl
     message_type = "[AUDIO MESSAGE]" if is_audio else ""
     force_answer_instruction = ""
     if intake_limit_reached:
-        # HARD OVERRIDE: the model has already asked
-        # symptom_intake_max_questions questions in this conversation
-        # (tracked in code, via app/memory.py's symptom_sessions table —
-        # not by asking the model to recall its own question count, which
-        # proved unreliable and caused endless/looping intake questions).
-        # At this point we force it to stop asking and actually answer.
+
         force_answer_instruction = f"""
 
 HARD OVERRIDE — READ FIRST: You have already asked {questions_asked_so_far} intake questions (accurate internal count). Do NOT ask another question under any circumstances. Provide your best possible guidance now using existing data, adhering to normal length/style rules. Recommend an in-person doctor exam if required. This overrides SYMPTOM INTAKE MODE."""
@@ -330,11 +259,7 @@ CRITICAL INTAKE CHECK: Review [CUSTOMER SUMMARY] and context carefully. If in SY
 {topic_switch_instruction}
     """.strip()
 
-    # required_language was already detected above, concurrently with the
-    # context gather() — reused here (via the returned tuple) for the
-    # follow-up suggestion in main.py, instead of get_llm_response() and
-    # generate_followup_suggestion() each running their own independent
-    # (but identical, deterministic) detection call.
+
 
     # Get LLM response
     try:
@@ -354,10 +279,7 @@ CRITICAL INTAKE CHECK: Review [CUSTOMER SUMMARY] and context carefully. If in SY
         logger.error(f"LLM error: {e}", exc_info=True)
         return "Sorry, I ran into an issue. Please try again in a moment.", required_language
 
-    # Update the deterministic question counter based on what actually
-    # came back — increment if the reply is itself another short intake
-    # question, reset back to 0 once the bot actually answers (so the
-    # NEXT new complaint starts counting fresh).
+
     try:
         if _looks_like_a_question(response):
             await asyncio.to_thread(memory.increment_symptom_question_count, phone_number)
@@ -373,25 +295,6 @@ SUMMARY_REFRESH_EVERY_N_MESSAGES = 3
 
 
 async def generate_new_summary(phone_number: str, current_summary: str, user_msg: str, ai_msg: str):
-    """Background task to async update the conversation summary using LLM.
-
-    IMPORTANT: this summary is internal bookkeeping only — it is never sent
-    to the user. It must always be written in English regardless of what
-    language the user is chatting in, otherwise its language leaks back
-    into future prompts (via [CUSTOMER SUMMARY]) and biases the main reply
-    generator toward whatever language the summary happens to be in, even
-    when the user's current message is in a different language.
-
-    THROTTLING: this is a background-only Gemini call — never shown to the
-    user directly — so it's the safest one to run less often under load.
-    The raw last-5-messages window ([CUSTOMER SUMMARY]'s companion context
-    in generate_context_aware_response) is rebuilt fresh from the DB on
-    every single turn regardless, so recent detail is never lost even when
-    the summary itself is a message or two stale. Only regenerate the
-    summary every SUMMARY_REFRESH_EVERY_N_MESSAGES messages for this user;
-    skip it otherwise (leaving the existing summary as-is) to cut Gemini
-    calls without any visible change in behavior.
-    """
     total_messages = await asyncio.to_thread(memory.get_message_count, phone_number)
     if total_messages % SUMMARY_REFRESH_EVERY_N_MESSAGES != 0:
         logger.info(
@@ -411,10 +314,7 @@ async def generate_new_summary(phone_number: str, current_summary: str, user_msg
     """
     try:
         new_summary = await get_summary_response(prompt)
-        # Was a bare (blocking) call — synchronous sqlite3 writes block the
-        # entire event loop, so under concurrent users every other user's
-        # request stalls for the duration of this disk write. Offload to a
-        # thread like every other memory.* call in this file.
+
         await asyncio.to_thread(memory.update_summary, phone_number, new_summary.strip())
         logger.info(f"✅ Updated summary for {phone_number}")
     except GeminiUnavailableError:
@@ -423,10 +323,7 @@ async def generate_new_summary(phone_number: str, current_summary: str, user_msg
         logger.error(f"❌ Error updating summary for {phone_number}: {e}", exc_info=True)
 
 
-# Per-category copy for the premium upsell message. Keyed by the same
-# free-text `category` values stored on users.category / premium_plans.category
-# (see memory.py). Add an entry here whenever a new category is introduced;
-# anything not listed falls back to the generic "health" wording below.
+
 _PREMIUM_OFFER_COPY = {
     "weight_loss": {
         "hook": "Want a real shot at losing weight, not just tips you'll forget by tomorrow?",
@@ -516,20 +413,20 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
                 logger.info(f"⌛ Premium expired for {phone_number} — sending expiry notice + new link.")
                 link = await create_payment_link(
                     phone_number=phone_number,
-                    amount_rupees=settings.premium_plan_amount_rupees,
-                    description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
+                    amount_rupees=settings.PREMIUM_PLAN_AMOUNT_RUPEES,
+                    description=f"AI Health Assistant — {settings.PREMIUM_PLAN_DAYS}-day Premium",
                 )
                 await asyncio.to_thread(
                     memory.save_payment_link,
                     link["id"],
                     phone_number,
-                    settings.premium_plan_amount_rupees * 100,
+                    settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
                     link.get("short_url"),
                 )
                 await asyncio.to_thread(memory.mark_subscription_expiry_notified, phone_number)
 
                 expiry_text = (
-                    f"Your {settings.premium_plan_days}-day Premium plan has expired. ⌛\n\n"
+                    f"Your {settings.PREMIUM_PLAN_DAYS}-day Premium plan has expired. ⌛\n\n"
                     f"Please buy again to keep getting your daily check-ins and "
                     f"priority answers — here's your payment link:\n"
                     f"{link['short_url']}"
@@ -550,28 +447,19 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
                 if created_at.tzinfo is not None:
                     created_at = created_at.replace(tzinfo=None)
                 seconds_since = (datetime.utcnow() - created_at).total_seconds()
-                if seconds_since < settings.premium_reoffer_min_gap_seconds:
+                if seconds_since < settings.PREMIUM_REOFFER_MIN_GAP_SECONDS:
                     logger.info(
                         f"⏭️ Skipping premium offer for {phone_number} — an unpaid link was "
                         f"already sent {seconds_since:.0f}s ago (throttle: "
-                        f"{settings.premium_reoffer_min_gap_seconds}s)."
+                        f"{settings.PREMIUM_REOFFER_MIN_GAP_SECONDS}s)."
                     )
                     return
 
         resent_existing_link = False
         if latest_link and latest_link.get("status") != "paid" and force_resend:
-            # Explicit ask — resend the SAME still-valid unpaid link
-            # instead of generating a brand new Razorpay payment link
-            # (avoids piling up duplicate unpaid link rows for one user
-            # every time they ask again within the same throttle window).
+
             logger.info(f"🔁 Explicit request — resending existing unpaid link for {phone_number}.")
-            # NOTE: the DB row's primary key column is "payment_link_id",
-            # not "id" (that's only the key name Razorpay's API uses on
-            # the object returned by create_payment_link). Reading
-            # latest_link["id"] here used to raise KeyError on every
-            # resend, which was swallowed by the outer except and logged
-            # as "Failed to create/send premium offer ... 'id'" — silently
-            # breaking every "please send me the link" follow-up.
+
             link = {"id": latest_link["payment_link_id"], "short_url": latest_link.get("short_url")}
             resent_existing_link = True
             if not link["short_url"]:
@@ -580,28 +468,28 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
                 # link rather than sending a message with no URL in it.
                 link = await create_payment_link(
                     phone_number=phone_number,
-                    amount_rupees=settings.premium_plan_amount_rupees,
-                    description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
+                    amount_rupees=settings.PREMIUM_PLAN_AMOUNT_RUPEES,
+                    description=f"AI Health Assistant — {settings.PREMIUM_PLAN_DAYS}-day Premium",
                 )
                 await asyncio.to_thread(
                     memory.save_payment_link,
                     link["id"],
                     phone_number,
-                    settings.premium_plan_amount_rupees * 100,
+                    settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
                     link.get("short_url"),
                 )
         else:
             logger.info(f"🆕 No active premium for {phone_number} — sending premium offer.")
             link = await create_payment_link(
                 phone_number=phone_number,
-                amount_rupees=settings.premium_plan_amount_rupees,
-                description=f"AI Health Assistant — {settings.premium_plan_days}-day Premium",
+                amount_rupees=settings.PREMIUM_PLAN_AMOUNT_RUPEES,
+                description=f"AI Health Assistant — {settings.PREMIUM_PLAN_DAYS}-day Premium",
             )
             await asyncio.to_thread(
                 memory.save_payment_link,
                 link["id"],
                 phone_number,
-                settings.premium_plan_amount_rupees * 100,
+                settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
                 link.get("short_url"),
             )
     except Exception as e:
@@ -610,16 +498,12 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
 
     try:
         if not resent_existing_link:
-            # Only (re-)insert on paths that created a link this call.
-            # ON CONFLICT DO NOTHING makes this technically safe to call
-            # unconditionally, but skipping it on a pure resend avoids a
-            # pointless DB round trip on every single "send me the link"
-            # follow-up.
+
             await asyncio.to_thread(
                 memory.save_payment_link,
                 link["id"],
                 phone_number,
-                settings.premium_plan_amount_rupees * 100,
+                settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
                 link.get("short_url"),
             )
 
@@ -629,8 +513,8 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
         offer_text = (
             f"Before we dive in — quick heads up 👋\n\n"
             f"{copy['hook']} "
-            f"Our {settings.premium_plan_days}-Day {copy['plan_name']} is ₹{settings.premium_plan_amount_rupees} and gives you:\n"
-            f"1. A daily action plan for {settings.premium_plan_days} days — {copy['daily_item']}\n"
+            f"Our {settings.PREMIUM_PLAN_DAYS}-Day {copy['plan_name']} is ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES} and gives you:\n"
+            f"1. A daily action plan for {settings.PREMIUM_PLAN_DAYS} days — {copy['daily_item']}\n"
             f"2. Priority, more detailed answers whenever you're stuck or plateauing\n"
             f"3. {copy['adapt_line']}\n\n"
             f"Totally optional — you can keep chatting normally either way. "
@@ -646,23 +530,10 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
         logger.error(f"❌ Failed to send/save premium offer message for {phone_number}: {e}", exc_info=True)
 
 
-# NOTE: premium-interest / explicit-request detection used to live here as
-# two `keyword in text.lower()` functions (_shows_premium_interest,
-# _requests_premium_plan_explicitly) against static keyword lists. Both
-# call sites now use classify_premium_intent() from app/llm.py instead —
-# an isolated small-model classifier call, same pattern as
-# detect_reply_language — because substring matching had no way to
-# represent negation or topic-correction (e.g. "vegetarian diet for
-# tuberculosis" matching "diet", or "no, tuberculosis diet, not weight
-# loss" still matching "weight loss" despite explicitly declining that
-# topic). See classify_premium_intent's docstring in app/llm.py for the
-# full rationale.
 
 
-# Very small set of common greeting openers. Only used to pick a friendly
-# greeting reply for _maybe_send_greeting below — NOT a gate on anything
-# else, so an unrecognized opener still safely falls through to the
-# normal warm intro rather than silence.
+
+
 _GREETING_WORDS = ("hi", "hii", "hiii", "hello", "hey", "heya", "yo", "namaste")
 
 
@@ -752,15 +623,7 @@ async def maybe_send_followup(
     a feature nobody is blocked on. Under normal load this never triggers
     and the follow-up behaves exactly as before.
     """
-    # HARD CODE-LEVEL GUARD (not left to the LLM to decide): if the main
-    # reply we just sent is ITSELF already a short intake-style question
-    # (e.g. "How long have you had the fever?", "Any cough?"), never fire
-    # the follow-up system on top of it. Relying on the follow-up LLM call
-    # to notice "the main reply was already a question" was unreliable in
-    # practice — it sometimes fired anyway, producing two questions back
-    # to back (or the same question twice), and could contradict what was
-    # already asked. A simple, deterministic text check here is far more
-    # reliable than asking the model to self-detect this every turn.
+
     if _looks_like_a_question(assistant_reply):
         logger.info(
             f"⏭️ Skipping follow-up for {phone_number} — main reply is "
@@ -852,10 +715,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
             if not value.messages:
                 continue
 
-            # Save/update contact name (from WhatsApp profile) for each sender.
-            # This is a blocking sqlite write — don't do it inline before the
-            # webhook ack; the whole point of the ack is to return fast so
-            # Meta doesn't time out and redeliver the event.
+
             if value.contacts:
                 for contact in value.contacts:
                     wa_id = contact.wa_id
@@ -865,20 +725,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(memory.set_user_name, wa_id, name)
 
             for raw_msg in value.messages:
-                # Don't await this inline — webhook must ack fast (200 OK)
-                # so WhatsApp/Meta never times out and redelivers the same
-                # event, which is what was causing duplicate delayed replies
-                # when Gemini was slow/erroring.
-                #
-                # enqueue_incoming() itself now retries transient failures
-                # and falls back to a durable dead-letter row on Postgres
-                # (see app/queueing.py) instead of raising in the common
-                # case. _safe_enqueue below is the last line of defense
-                # for the one case it can still raise: the dead-letter DB
-                # write itself failing too. FastAPI's BackgroundTasks
-                # swallows exceptions from tasks silently — without this
-                # wrapper, that failure mode would go back to being
-                # invisible, which is exactly the bug we're fixing.
+
                 background_tasks.add_task(_safe_enqueue, raw_msg)
 
     return {"status": "ok"}
@@ -905,10 +752,7 @@ async def razorpay_webhook(request: Request):
     event = body.get("event", "")
     logger.info(f"💰 Razorpay webhook event: {event}")
 
-    # We only care about a payment link actually being paid. Razorpay also
-    # sends payment.captured, order.paid, etc. — payment_link.paid is the
-    # one tied to what we created, and its payload carries the
-    # payment_link_id we stored when we created the link.
+
     if event != "payment_link.paid":
         return {"status": "ok"}
 
@@ -933,16 +777,16 @@ async def razorpay_webhook(request: Request):
     expires_at = await asyncio.to_thread(
         memory.activate_subscription,
         phone_number,
-        settings.premium_plan_days,
+        settings.PREMIUM_PLAN_DAYS,
         payment_link_id,
     )
-    logger.info(f"✅ Activated {settings.premium_plan_days}-day premium for {phone_number}, expires {expires_at}")
+    logger.info(f"✅ Activated {settings.PREMIUM_PLAN_DAYS}-day premium for {phone_number}, expires {expires_at}")
 
     confirm_text = (
         f"Payment received, thank you! 🎉\n\n"
-        f"Your {settings.premium_plan_days}-day Premium plan is now active. "
+        f"Your {settings.PREMIUM_PLAN_DAYS}-day Premium plan is now active. "
         f"You'll get a personalized daily check-in right here in this chat for the next "
-        f"{settings.premium_plan_days} days, along with priority answers in the meantime."
+        f"{settings.PREMIUM_PLAN_DAYS} days, along with priority answers in the meantime."
     )
     try:
         await send_text_message(phone_number, confirm_text)
@@ -955,13 +799,9 @@ async def razorpay_webhook(request: Request):
         # payment activation or make the webhook look like it failed to Razorpay.
         logger.error(f"❌ Failed to send payment confirmation to {phone_number}: {e}", exc_info=True)
 
-    # ============ ONBOARDING: category selection + questions ============
-    # Kicks off right after subscribe (see the architecture diagram).
-    # Category defaults to settings.default_plan_category ("weight_loss")
-    # for now — a future paywall/menu step could let the user pick before
-    # this call instead of always defaulting.
+
     try:
-        await start_onboarding(memory, phone_number, category=settings.default_plan_category)
+        await start_onboarding(memory, phone_number, category=settings.DEFAULT_PLAN_CATEGORY)
     except Exception as e:
         logger.error(f"❌ Failed to start onboarding for {phone_number}: {e}", exc_info=True)
 
@@ -983,20 +823,12 @@ async def _handle_incoming(raw_msg: dict) -> None:
 
     sender = msg.from_
 
-    # Skip if WhatsApp already redelivered this exact message (e.g. retry
-    # after our previous response was slow/failed, or after a server
-    # restart). Backed by Redis (see app/idempotency.py) so it survives
-    # restarts AND is shared across worker processes — an in-memory set,
-    # or state private to one worker, would not catch a redelivery that
-    # lands on a *different* worker than the one that handled it first.
+
     if not await try_mark_message_processed(msg.id):
         logger.info(f"⏭️ Duplicate webhook delivery for message id={msg.id}, skipping.")
         return
 
-    # Skip if this message is too old to be a live query anymore (stale
-    # webhook redelivery). Without this, a message from hours ago could
-    # still trigger a fresh Gemini call and an out-of-nowhere "sorry"
-    # reply long after the conversation ended.
+
     try:
         age_seconds = time.time() - int(msg.timestamp)
     except (TypeError, ValueError):
@@ -1012,10 +844,7 @@ async def _handle_incoming(raw_msg: dict) -> None:
 
     background_tasks: list[asyncio.Task[None]] = []
 
-    # Fire-and-forget: don't block reply generation on this network call.
-    # show_typing=True also shows WhatsApp's native "typing…" indicator to
-    # the user while we're generating the reply (via Gemini/RAG/etc.), so
-    # it doesn't look like the message went nowhere during that wait.
+
     background_tasks.append(asyncio.create_task(mark_as_read(msg.id, show_typing=True)))
 
     # ============ TEXT MESSAGE ============
@@ -1023,39 +852,7 @@ async def _handle_incoming(raw_msg: dict) -> None:
         user_text = msg.text.body.strip()
         logger.info(f"👤 [{sender}]: {user_text}")
 
-        # ============ PREMIUM UPSELL: only when the message itself shows
-        # interest (weight-loss/health-goal talk, or explicitly asking
-        # about the plan/subscription) — NOT on every generic "hii"/
-        # "hello" opener, and NOT when the message merely shares a word
-        # with plan-related vocabulary (e.g. "diet") while actually being
-        # about something else entirely, or explicitly correcting/
-        # declining an earlier misfire (e.g. "no, tuberculosis diet, not
-        # weight loss"). A brand new user who just says hi gets a warm,
-        # low-key intro instead (see _maybe_send_greeting below); the
-        # payment-link pitch only fires once they've actually engaged
-        # with the topic.
-        #
-        # This used to be `_shows_premium_interest(user_text)` — a
-        # `keyword in text.lower()` substring check against a large
-        # static keyword list. That's what produced the exact bug seen in
-        # production: a user saying "vegetarian diet for tuberculosis"
-        # matched "diet" and got the fat-loss-plan pitch instead of an
-        # answer, and every follow-up attempt to redirect back to
-        # tuberculosis ("no, tuberculosis diet, not weight loss") still
-        # matched "weight loss"/"diet" and re-triggered the same canned
-        # pitch, effectively locking the user out of ever getting their
-        # real question answered. Keyword substring-matching can't
-        # represent negation or topic-correction, so no tweak to the
-        # keyword list can fully fix it — this needs actual intent
-        # understanding, which is what classify_premium_intent()
-        # provides (small isolated Gemini call, same proven pattern as
-        # detect_reply_language, with recent context so it can see when
-        # the user is correcting a prior turn).
-        #
-        # Awaited (not fire-and-forget) and placed before any
-        # save_message()/append_turn() call for this turn — those
-        # overwrite last_message_at with "now", so reading it after
-        # saving would always look like 0 seconds have passed. ============
+
         recent_context_for_intent = await asyncio.to_thread(
             memory.get_conversation_context, sender, limit=5
         )
@@ -1066,15 +863,7 @@ async def _handle_incoming(raw_msg: dict) -> None:
             explicit_request = premium_intent["explicit_request"]
             await _maybe_send_premium_offer(sender, force_resend=explicit_request)
             if explicit_request:
-                # The user directly asked for the plan/payment link and
-                # _maybe_send_premium_offer just sent it (or skipped only
-                # because they already have an active subscription/it's
-                # genuinely unavailable — either way, that IS the answer
-                # to this turn). Stop here so the generic LLM Q&A path
-                # below doesn't also generate a second, contradictory
-                # reply for the same message — e.g. hallucinating "I
-                # can't provide direct purchase links" right after the
-                # link was actually sent, which is confusing and wrong.
+
                 await asyncio.to_thread(
                     memory.save_message, sender, "user", user_text, message_type="text"
                 )
@@ -1082,22 +871,13 @@ async def _handle_incoming(raw_msg: dict) -> None:
         else:
             greeted = await _maybe_send_greeting(sender)
             if greeted:
-                # This was the user's very first message and it was just
-                # a plain greeting ("hii"/"hello") with no health content
-                # to actually respond to — the intro above IS the reply
-                # for this turn. Save it as the user's turn and stop here
-                # so the normal LLM Q&A path doesn't also send its own
-                # generic "Hi there! How can I help you today?" on top of
-                # it (that duplication was the actual bug being fixed).
+
                 await asyncio.to_thread(
                     memory.save_message, sender, "user", user_text, message_type="text"
                 )
                 return
 
-        # ---- ONBOARDING IN PROGRESS: route straight into the question flow ----
-        # Must run before any other text handling (commands, follow-up
-        # capture, normal Q&A) — while onboarding is active, every incoming
-        # text IS the answer to the current onboarding question.
+
         try:
             consumed = await handle_onboarding_reply(memory, sender, user_text)
             if consumed:
@@ -1105,12 +885,7 @@ async def _handle_incoming(raw_msg: dict) -> None:
         except Exception as e:
             logger.error(f"❌ Onboarding reply handling failed for {sender}: {e}", exc_info=True)
 
-        # ---- SAME-DAY FOLLOW-UP CAPTURE ----
-        # If this user was just sent today's plan message + follow-up
-        # question (see app/daily_checkin.py), the first text they send
-        # back is logged against that day's followup_answer — per the
-        # architecture, this is logging only and never rewrites any other
-        # day's pregenerated message_text.
+
         try:
             awaiting = await asyncio.to_thread(memory.get_awaiting_followup_day, sender)
             if awaiting:
@@ -1209,11 +984,7 @@ Type /stats to see your conversation statistics.
             )
             return
 
-        # Save user message + assistant reply (only once we know we have a
-        # real reply). Wrapped in try/except so a DB failure (locked file,
-        # disk full, bad path, etc.) is logged loudly instead of silently
-        # disappearing inside this background task — and so we still send
-        # the reply to the user even if persistence fails.
+
         try:
             await asyncio.to_thread(memory.save_message, sender, "user", user_text, message_type="text")
             await asyncio.to_thread(memory.save_message, sender, "assistant", reply, message_type="text")
@@ -1278,13 +1049,7 @@ Type /stats to see your conversation statistics.
             audio_path = await asyncio.to_thread(memory.save_audio_file, sender, media_bytes)
             logger.info(f"💾 Audio saved to {audio_path}")
             
-            # Transcribe audio — returns {"text": ..., "language": ...},
-            # where "language" is what Whisper itself detected from the
-            # AUDIO (e.g. "english", "hindi"). Short/accented clips can
-            # make Whisper mis-transcribe into the wrong Indic script, so
-            # we carry this detected language through separately and let
-            # it override the (possibly garbled) transcribed text when
-            # deciding which language to reply in.
+
             transcription_result = await transcribe_audio(media_bytes, audio_format="ogg")
             
             if not transcription_result or not transcription_result.get("text"):
@@ -1296,11 +1061,7 @@ Type /stats to see your conversation statistics.
             
             logger.info(f"📝 Transcription: {transcription[:100]}... | detected_language={whisper_language}")
 
-            # Generate context-aware response FIRST — only persist anything
-            # (user message, audio path, reply) once we know Gemini actually
-            # answered. If Gemini is down, don't save to DB, but still let
-            # the user know instead of leaving them hanging after the
-            # "Processing audio..." message.
+
             try:
                 reply, required_language = await generate_context_aware_response(
                     sender, transcription, is_audio=True, whisper_language=whisper_language,
@@ -1481,24 +1242,19 @@ async def run_daily_checkins_endpoint():
     app/daily_checkin.py). Useful for testing without waiting for the
     scheduled hour.
     """
-    from app.daily_checkin import run_daily_checkins
+    from app.services.daily_checkin import run_daily_checkins
     await run_daily_checkins()
     return {"status": "ok", "message": "Daily check-in run completed."}
 
 
 @app.get("/health", tags=["Health"])
 async def health():
-    # Surface dead-letter backlog in the health payload so it's visible
-    # to whatever's already polling /health (uptime checks, dashboards)
-    # without needing a separate alert wired up from day one. A non-zero
-    # count here means messages failed to enqueue and are waiting on
-    # dead_letter_worker.py to replay them — worth alerting on if it
-    # stays non-zero for more than a few minutes.
+
     pending_dead_letters = await asyncio.to_thread(memory.count_pending_dead_letters)
     return {
         "status": "ok",
         "bot": "AI Health Assistant",
-        "phone_number_id": settings.phone_number_id,
+        "phone_number_id": settings.PHONE_NUMBER_ID,
         "supported_media": ["text", "audio", "image"],
         "features": [
             "Context-aware health Q&A",
@@ -1552,9 +1308,9 @@ async def debug():
 
     return {
         "config": {
-            "phone_number_id": settings.phone_number_id,
-            "openai_key_set": bool(settings.openai_api_key),
-            "verify_token_set": bool(settings.verify_token),
+            "phone_number_id": settings.PHONE_NUMBER_ID,
+            "openai_key_set": bool(settings.OPENAI_API_KEY),
+            "verify_token_set": bool(settings.VERIFY_TOKEN),
         },
         "token_check": token_check,
         "database": {

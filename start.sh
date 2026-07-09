@@ -6,7 +6,7 @@ BIND="${BIND:-0.0.0.0:8000}"
 TIMEOUT="${GUNICORN_TIMEOUT:-120}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
-exec gunicorn app.main:app \
+exec gunicorn app.api.main:app \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers "${WEB_CONCURRENCY}" \
     --bind "${BIND}" \

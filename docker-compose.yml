@@ -133,7 +133,7 @@ services:
       QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
       QUEUE_NAME: "${QUEUE_NAME:-default}"
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-    command: ["python", "worker.py"]
+    command: ["python", "-m", "app.workers.worker"]
     volumes:
       - audio_storage:/app/audio_storage
     depends_on:
@@ -156,7 +156,7 @@ services:
       DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
       QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-    command: ["python", "outbound_worker.py"]
+    command: ["python", "-m", "app.workers.outbound_worker"]
     depends_on:
       db:
         condition: service_healthy
@@ -181,7 +181,7 @@ services:
       QUEUE_BACKEND: "${QUEUE_BACKEND:-rq}"
       QUEUE_NAME: "${QUEUE_NAME:-default}"
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
-    command: ["python", "dead_letter_worker.py"]
+    command: ["python", "-m", "app.workers.dead_letter_worker"]
     depends_on:
       db:
         condition: service_healthy
@@ -201,7 +201,7 @@ services:
     # day at DAILY_CHECKIN_HOUR_UTC (see app/config.py). Swap this command
     # for `["python", "-m", "app.daily_checkin", "--once"]` on an external
     # cron trigger instead, if you'd rather not run a long-lived loop.
-    command: ["python", "-m", "app.daily_checkin"]
+    command: ["python", "-m", "app.services.daily_checkin"]
     depends_on:
       db:
         condition: service_healthy

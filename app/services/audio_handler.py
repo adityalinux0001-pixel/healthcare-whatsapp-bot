@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import os
 from typing import Optional, Tuple
-from app.config import get_settings
+from app.core.config import get_settings
 
 logger = logging.getLogger("audio_handler")
 settings = get_settings()
@@ -183,11 +183,7 @@ async def get_audio_duration_seconds(audio_bytes: bytes, audio_format: str = "og
             tmp.write(audio_bytes)
             tmp_path = tmp.name
 
-        # asyncio.create_subprocess_exec needs a ProactorEventLoop on Windows
-        # to spawn child processes at all — uvicorn's default loop under
-        # --reload (watchfiles) can end up on SelectorEventLoop, which raises
-        # NotImplementedError here. Fall back to a blocking subprocess.run in
-        # a thread, which works regardless of the event loop in use.
+
         result = await asyncio.to_thread(
             subprocess.run,
             [
@@ -242,7 +238,7 @@ async def transcribe_audio(audio_bytes: bytes, audio_format: str = "ogg") -> Opt
             'model': 'whisper-1',
             'response_format': 'verbose_json',
         }
-        headers = {'Authorization': f'Bearer {settings.openai_api_key}'}
+        headers = {'Authorization': f'Bearer {settings.OPENAI_API_KEY}'}
 
         response = await _client().post(
             "https://api.openai.com/v1/audio/transcriptions",
