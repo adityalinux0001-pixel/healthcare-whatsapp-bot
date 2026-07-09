@@ -296,14 +296,7 @@ async def generate_context_aware_response(
         if premium_intent["premium_related"]:
             topic_switch_instruction = """
 
-HARD OVERRIDE — READ THIS FIRST: the user's CURRENT message is about the
-premium plan/subscription/payment, not a symptom detail. Do NOT ask a
-symptom-intake question in this reply, even if an earlier symptom
-conversation is still visible above. Answer only what they just asked
-about the plan (its content, price, payment link, what it includes, or
-answering their question about it) — do not use their earlier symptom
-description as a reason to change the subject back. If they explicitly
-return to discussing symptoms in a LATER message, intake can resume then."""
+HARD OVERRIDE — READ FIRST: The user's CURRENT message is about the premium plan/subscription/payment, not symptoms. Do NOT ask a symptom-intake question. Answer only their plan-related question (pricing, content, payment link, etc.). Do not pivot back to previous symptoms. Intake can resume only if they explicitly return to symptoms in a later message."""
 
     # Build enriched prompt with context
     message_type = "[AUDIO MESSAGE]" if is_audio else ""
@@ -317,15 +310,7 @@ return to discussing symptoms in a LATER message, intake can resume then."""
         # At this point we force it to stop asking and actually answer.
         force_answer_instruction = f"""
 
-HARD OVERRIDE — READ THIS FIRST: you have already asked {questions_asked_so_far}
-short intake questions in this conversation (tracked separately, this count
-is accurate regardless of what you can see above). Do NOT ask another
-question under any circumstances, even if you feel a detail is still
-missing. Give your best possible answer/guidance right now using
-everything gathered so far, per the normal length/style rules — including
-recommending the user see a doctor if what's been described genuinely
-needs an in-person exam. This instruction overrides SYMPTOM INTAKE MODE
-above."""
+HARD OVERRIDE — READ FIRST: You have already asked {questions_asked_so_far} intake questions (accurate internal count). Do NOT ask another question under any circumstances. Provide your best possible guidance now using existing data, adhering to normal length/style rules. Recommend an in-person doctor exam if required. This overrides SYMPTOM INTAKE MODE."""
 
     enriched_prompt = f"""
 {message_type}
@@ -338,17 +323,9 @@ above."""
 [CURRENT USER MESSAGE]
 {user_message}
 
-Answer only the current user message above, directly and briefly (per the
-system prompt's length rule), using the conversation context only to stay
-consistent — do not re-summarize the context or restate prior messages.
+Answer only the current user message directly and briefly. Use the conversation context solely for consistency—do not re-summarize or restate past messages.
 
-IMPORTANT — read the conversation context above carefully before replying,
-especially if you are in SYMPTOM INTAKE MODE: NEVER ask about a detail
-(duration, severity, associated symptoms, etc.) that the user has ALREADY
-given you anywhere in [CUSTOMER SUMMARY] or the conversation context above.
-Ask about the NEXT missing detail only. If every detail you'd normally ask
-about has already been covered, stop asking questions and give your actual
-answer/guidance instead.
+CRITICAL INTAKE CHECK: Review [CUSTOMER SUMMARY] and context carefully. If in SYMPTOM INTAKE MODE, NEVER ask for details (duration, severity, etc.) already provided. Ask only for the next missing detail. If all necessary information is present, stop questioning and provide your final guidance.
 {force_answer_instruction}
 {topic_switch_instruction}
     """.strip()
