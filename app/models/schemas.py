@@ -165,53 +165,6 @@ class WebhookPayload(BaseModel):
     entry: List[WebhookEntry]
 
 
-# ============ VOICE RESPONSE MODELS ============
-
-class VoiceResponseConfig(BaseModel):
-    """Configuration for voice responses."""
-    enabled: bool = True
-    voice_preset: str = "professional"  # professional, friendly, deep, dynamic, calm
-    stability: float = 0.5
-    similarity_boost: float = 0.75
-    model_id: str = "eleven_monolingual_v1"
-
-
-class AudioProcessingResult(BaseModel):
-    """Result of audio processing."""
-    success: bool
-    text: Optional[str] = None
-    error: Optional[str] = None
-    audio_size: str
-    processing_time: float  # milliseconds
-    confidence: Optional[float] = None
-
-
-class VoiceMessageResponse(BaseModel):
-    """Response containing voice message."""
-    status: str
-    message_id: Optional[str] = None
-    audio_bytes_sent: Optional[int] = None
-    fallback_text: Optional[str] = None
-    error: Optional[str] = None
-
-
-# ============ CONVERSATION MODELS ============
-
-class ConversationTurn(BaseModel):
-    """Single turn in conversation history."""
-    role: str  # "user" or "assistant"
-    content: str
-    timestamp: Optional[datetime] = None
-
-
-class ConversationHistory(BaseModel):
-    """Conversation history for a user."""
-    user_id: str
-    turns: List[ConversationTurn]
-    created_at: datetime
-    last_message_at: datetime
-
-
 # ============ HEALTH/DEBUG MODELS ============
 
 class HealthResponse(BaseModel):
