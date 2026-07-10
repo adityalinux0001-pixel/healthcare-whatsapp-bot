@@ -33,20 +33,6 @@ envVarGroups:
         value: "499"
       - key: PREMIUM_PLAN_DAYS
         value: "21"
-      - key: DATABASE_URL
-        fromDatabase:
-          name: healthbot-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: healthbot-redis
-          property: connectionString
-      - key: KAFKA_BOOTSTRAP_SERVERS
-        fromService:
-          type: pserv
-          name: healthbot-kafka
-          property: hostport
       - key: QUEUE_BACKEND
         value: kafka
       - key: KAFKA_NUM_PARTITIONS
@@ -116,6 +102,20 @@ services:
     healthCheckPath: /health
     envVars:
       - fromGroup: healthbot-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: healthbot-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: healthbot-redis
+          property: connectionString
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        fromService:
+          type: pserv
+          name: healthbot-kafka
+          property: hostport
       - key: BIND
         value: "0.0.0.0:10000"
       - key: WEB_CONCURRENCY
@@ -139,6 +139,20 @@ services:
       sizeGB: 5
     envVars:
       - fromGroup: healthbot-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: healthbot-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: healthbot-redis
+          property: connectionString
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        fromService:
+          type: pserv
+          name: healthbot-kafka
+          property: hostport
 
   # ---- Outbound Kafka worker ----
   - type: worker
@@ -150,6 +164,20 @@ services:
     dockerCommand: python -m app.workers.outbound_worker
     envVars:
       - fromGroup: healthbot-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: healthbot-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: healthbot-redis
+          property: connectionString
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        fromService:
+          type: pserv
+          name: healthbot-kafka
+          property: hostport
 
   # ---- Dead-letter replay worker ----
   - type: worker
@@ -161,6 +189,20 @@ services:
     dockerCommand: python -m app.workers.dead_letter_worker
     envVars:
       - fromGroup: healthbot-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: healthbot-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: healthbot-redis
+          property: connectionString
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        fromService:
+          type: pserv
+          name: healthbot-kafka
+          property: hostport
 
   # ---- Daily premium check-in (cron, runs once/day) ----
   - type: cron
@@ -173,3 +215,17 @@ services:
     schedule: "0 9 * * *"
     envVars:
       - fromGroup: healthbot-secrets
+      - key: DATABASE_URL
+        fromDatabase:
+          name: healthbot-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: healthbot-redis
+          property: connectionString
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        fromService:
+          type: pserv
+          name: healthbot-kafka
+          property: hostport
