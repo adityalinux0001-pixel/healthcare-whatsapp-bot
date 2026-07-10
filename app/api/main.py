@@ -37,6 +37,7 @@ from app.services.llm import (
     process_image_with_vision,
     generate_followup_suggestion,
     detect_reply_language,
+    translate_premium_offer_text,
     classify_premium_intent,
     is_gemini_busy,
     GeminiUnavailableError,
@@ -228,9 +229,9 @@ async def generate_context_aware_response(
     if not intake_limit_reached:
         premium_intent = await classify_premium_intent(user_message, recent_context=context_text)
         if premium_intent["premium_related"]:
-            topic_switch_instruction = """
+            topic_switch_instruction = f"""
 
-HARD OVERRIDE — READ FIRST: The user's CURRENT message is about the premium plan/subscription/payment, not symptoms. Do NOT ask a symptom-intake question. Answer only their plan-related question (pricing, content, payment link, etc.). Do not pivot back to previous symptoms. Intake can resume only if they explicitly return to symptoms in a later message."""
+HARD OVERRIDE — READ FIRST: The user's CURRENT message is about the premium plan/subscription/payment, not symptoms. Do NOT ask a symptom-intake question. Answer only their plan-related question (pricing, content, payment link, etc.). Do not pivot back to previous symptoms. Intake can resume only if they explicitly return to symptoms in a later message. IMPORTANT: still write your ENTIRE reply in [REQUIRED_LANGUAGE] ({required_language}) exactly as instructed above — do not switch to English just because the plan details or prior messages were in English."""
 
     # Build enriched prompt with context
     message_type = "[AUDIO MESSAGE]" if is_audio else ""
@@ -353,7 +354,9 @@ _DEFAULT_PREMIUM_OFFER_COPY = {
 }
 
 
-async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = False) -> None:
+async def _maybe_send_premium_offer(
+    phone_number: str, force_resend: bool = False, required_language: str | None = None
+) -> None:
     """
     Runs on EVERY incoming message and decides whether to send a Razorpay
     payment link for the 21-day premium plan. Three cases:
@@ -430,6 +433,9 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
                     f"Please buy again to keep getting your daily check-ins and "
                     f"priority answers — here's your payment link:\n"
                     f"{link['short_url']}"
+                )
+                expiry_text = await translate_premium_offer_text(
+                    expiry_text, required_language or "English"
                 )
                 await send_text_message(phone_number, expiry_text)
                 await asyncio.to_thread(
@@ -520,6 +526,9 @@ async def _maybe_send_premium_offer(phone_number: str, force_resend: bool = Fals
             f"Totally optional — you can keep chatting normally either way. "
             f"If you'd like to grab it, here's your secure payment link:\n"
             f"{link['short_url']}"
+        )
+        offer_text = await translate_premium_offer_text(
+            offer_text, required_language or "English"
         )
         await send_text_message(phone_number, offer_text)
         await asyncio.to_thread(
@@ -861,7 +870,10 @@ async def _handle_incoming(raw_msg: dict) -> None:
         )
         if premium_intent["premium_related"]:
             explicit_request = premium_intent["explicit_request"]
-            await _maybe_send_premium_offer(sender, force_resend=explicit_request)
+            offer_required_language = await detect_reply_language(user_text)
+            await _maybe_send_premium_offer(
+                sender, force_resend=explicit_request, required_language=offer_required_language
+            )
             if explicit_request:
 
                 await asyncio.to_thread(
