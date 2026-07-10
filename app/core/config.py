@@ -54,15 +54,10 @@ class Settings(BaseSettings):
 
     GEMINI_MAX_CONCURRENT_REQUESTS: int = 8
 
-    # Raised from 3 -> 4 retries so a request landing during a brief
-    # Gemini overload spike (common when many users message at once) gets
-    # more chances to succeed via backoff before being dropped.
-    GEMINI_MAX_RETRIES: int = 4
-
-    # Backoff between retries, in seconds: base * (2 ** attempt), plus a
-    # small random jitter so many queued requests retrying at once don't
-    # all hammer Gemini at the exact same instant.
+    GEMINI_MAX_RETRIES: int = 5
     GEMINI_RETRY_BASE_DELAY_SECONDS: float = 1.0
+
+    GEMINI_RETRY_MAX_DELAY_SECONDS: float = 12.0
 
 
     DATABASE_URL: str = "postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot"

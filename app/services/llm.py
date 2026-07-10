@@ -174,6 +174,7 @@ async def _call_gemini(coro_fn, *, label: str):
                 last_exc = e
                 if attempt < settings.GEMINI_MAX_RETRIES:
                     delay = settings.GEMINI_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+                    delay = min(delay, settings.GEMINI_RETRY_MAX_DELAY_SECONDS)
                     delay += random.uniform(0, delay * 0.25)
                     logger.warning(
                         f"Gemini[{label}]: transient error on attempt "
@@ -1006,7 +1007,7 @@ Generate the full {total_days}-day JSON plan now, following the rules and format
                 contents=[types.Part(text=prompt)],
                 config=types.GenerateContentConfig(
                     system_instruction=full_system_prompt,
-                    max_output_tokens=get_settings().plan_generation_max_output_tokens,
+                    max_output_tokens=get_settings().PLAN_GENERATION_MAX_OUTPUT_TOKENS,
                     temperature=0.6,
                     response_mime_type="application/json",
                 ),
