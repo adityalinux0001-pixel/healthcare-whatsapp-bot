@@ -27,8 +27,6 @@ envVarGroups:
         value: INFO
       - key: MAX_HISTORY_TURNS
         value: "10"
-      - key: SESSION_GAP_SECONDS
-        value: "21600"
       - key: PREMIUM_PLAN_AMOUNT_RUPEES
         value: "499"
       - key: PREMIUM_PLAN_DAYS
