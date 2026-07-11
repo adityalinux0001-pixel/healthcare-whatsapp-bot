@@ -312,6 +312,80 @@ async def detect_reply_language(
     return await _detect_reply_language(client, text, whisper_language)
 
 
+async def _translate_fixed_text(
+    client: "genai.Client",
+    text: str,
+    required_language: str,
+) -> str:
+    """
+    Translate a fixed, pre-written English template (premium offer /
+    expiry notice) into the user's detected reply language.
+
+    Kept as its own tiny, isolated Gemini call — same reasoning as
+    _detect_reply_language: mixing this into a larger prompt risks the
+    model drifting in tone or partially translating. Here the input is
+    ONLY the template text plus the target language name, so the model
+    has nothing else to get confused by.
+
+    Numbers, the ₹ amount, emojis, the payment link URL, and the
+    1./2./3. list structure must be preserved exactly — only the
+    surrounding words get translated. If the target language is plain
+    English, the original text is returned unchanged (no wasted call).
+    If the call fails for any reason, the original English text is
+    returned rather than blocking the send.
+    """
+    if not required_language or required_language.strip().lower() == "english":
+        return text
+
+    try:
+        response = await _call_gemini(
+            lambda: client.aio.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[types.Part(text=text)],
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are a precise translator. Translate the given "
+                    f"WhatsApp message into {required_language}. "
+                    "Rules:\n"
+                    "- Preserve the exact structure: line breaks, the "
+                    "1./2./3. numbered list, and all emojis exactly where "
+                    "they are.\n"
+                    "- Do NOT translate or alter URLs (e.g. links "
+                    "starting with http/https), numbers, or the ₹ "
+                    "currency amount — keep those exactly as written.\n"
+                    "- Translate only the surrounding natural-language "
+                    "words/sentences.\n"
+                    "- Output ONLY the translated message, nothing else "
+                    "— no preamble, no explanation, no quotes."
+                ),
+                max_output_tokens=600,
+                temperature=0.0,
+            ),
+            ),
+            label="premium offer translation",
+        )
+        translated = (response.text or "").strip()
+        if translated:
+            return translated
+    except Exception as e:
+        logger.warning(
+            f"Premium offer translation failed, sending English original: {e}"
+        )
+
+    return text
+
+
+async def translate_premium_offer_text(text: str, required_language: str) -> str:
+    """
+    Public wrapper around _translate_fixed_text() for main.py to translate
+    the fixed premium-offer / expiry-notice templates into the user's
+    detected reply language, mirroring the detect_reply_language()
+    public-wrapper pattern above.
+    """
+    client = _get_client()
+    return await _translate_fixed_text(client, text, required_language)
+
+
 async def _classify_premium_intent(
     client: "genai.Client",
     user_text: str,
