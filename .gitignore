@@ -28,3 +28,5 @@ dist/
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+*.zip
