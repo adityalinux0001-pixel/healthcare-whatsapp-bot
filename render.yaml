@@ -59,6 +59,12 @@ services:
       mountPath: /var/lib/kafka/data
       sizeGB: 10
     envVars:
+      # Tell Render which port this private service actually listens on.
+      # Without this, Render defaults to 10000 and every downstream
+      # fromService/hostport reference (including the self-reference
+      # below) resolves to the wrong port.
+      - key: PORT
+        value: "9092"
       - key: KAFKA_NODE_ID
         value: "1"
       - key: KAFKA_PROCESS_ROLES
@@ -67,16 +73,12 @@ services:
         value: "1@localhost:9093"
       - key: KAFKA_LISTENERS
         value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
-      # Self-reference: Render injects this service's own stable
-      # internal host:port so other services can resolve it correctly.
+      # Hardcoded rather than a fromService self-reference: Kafka requires
+      # the listener scheme (PLAINTEXT://) prefixed onto the host:port,
+      # and fromService/hostport only ever returns the bare "host:port"
+      # with no scheme, which Kafka rejects at startup.
       - key: KAFKA_ADVERTISED_LISTENERS
-        fromService:
-          type: pserv
-          name: healthbot-kafka
-          property: hostport
-        # value shape becomes e.g. "healthbot-kafka-xxxx:9092" — Kafka
-        # needs the PLAINTEXT:// scheme prefix added; see deployment
-        # notes below for the one manual edit this requires.
+        value: "PLAINTEXT://healthbot-kafka:9092"
       - key: KAFKA_CONTROLLER_LISTENER_NAMES
         value: CONTROLLER
       - key: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
