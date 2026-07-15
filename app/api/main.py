@@ -862,6 +862,24 @@ async def _handle_incoming(raw_msg: dict) -> None:
         logger.info(f"👤 [{sender}]: {user_text}")
 
 
+        # Onboarding answers MUST be captured before any intent
+        # classification runs. Otherwise a reply like "8am" to onboarding
+        # question 8 ("What time should I send your daily check-in?") gets
+        # fed into classify_premium_intent() along with recent context that
+        # literally contains the words "premium"/"check-in"/"plan" (the
+        # question prompt itself), which can flag it as premium_related /
+        # explicit_request and `return` before handle_onboarding_reply ever
+        # runs — silently stranding the user on question 8 forever, with no
+        # plan ever generated and therefore no Day 2+ check-ins possible.
+        # An in-progress onboarding session should always win over any other
+        # routing.
+        try:
+            consumed = await handle_onboarding_reply(memory, sender, user_text)
+            if consumed:
+                return
+        except Exception as e:
+            logger.error(f"❌ Onboarding reply handling failed for {sender}: {e}", exc_info=True)
+
         recent_context_for_intent = await asyncio.to_thread(
             memory.get_conversation_context, sender, limit=5
         )
@@ -888,14 +906,6 @@ async def _handle_incoming(raw_msg: dict) -> None:
                     memory.save_message, sender, "user", user_text, message_type="text"
                 )
                 return
-
-
-        try:
-            consumed = await handle_onboarding_reply(memory, sender, user_text)
-            if consumed:
-                return
-        except Exception as e:
-            logger.error(f"❌ Onboarding reply handling failed for {sender}: {e}", exc_info=True)
 
 
         try:
