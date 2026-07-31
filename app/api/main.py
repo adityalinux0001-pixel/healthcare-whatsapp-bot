@@ -17,7 +17,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, Query, BackgroundTasks
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse
 from app.core.config import get_settings
 from app.models.schemas import (
     WebhookPayload,
@@ -51,7 +51,11 @@ from app.services.audio_handler import (
     get_audio_duration_seconds,
 )
 from app.core.queueing import enqueue_incoming
-from app.services.razorpay_client import create_payment_link, verify_webhook_signature
+from app.services.phonepe_client import (
+    create_payment_link,
+    verify_webhook_authorization,
+    link_is_still_valid,
+)
 from app.services.onboarding import start_onboarding, handle_onboarding_reply
 
 # Voice notes longer than this are rejected outright — client requirement.
@@ -358,7 +362,7 @@ async def _maybe_send_premium_offer(
     phone_number: str, force_resend: bool = False, required_language: str | None = None
 ) -> None:
     """
-    Runs on EVERY incoming message and decides whether to send a Razorpay
+    Runs on EVERY incoming message and decides whether to send a PhonePe
     payment link for the 21-day premium plan. Three cases:
 
     1. ACTIVE SUBSCRIPTION (is_premium_active() True):
@@ -387,15 +391,19 @@ async def _maybe_send_premium_offer(
        _requests_premium_plan_explicitly) — a user who directly asks
        "send me the link" should always get one back, even if the
        last unpaid link was sent minutes ago. Re-sends the EXISTING
-       unpaid link when there is one (no new Razorpay link/row created)
+       unpaid link when there is one (no new PhonePe order/row created)
        rather than generating a fresh link every time they ask, since
        the old one is still valid and paying against it works the same.
+       PhonePe checkout URLs do expire, though (Razorpay's never did), so
+       the existing link is only reused while it's still inside its
+       validity window — past that a fresh one is created so the user is
+       never handed a dead link.
 
     Runs on every message (no session-gap gate) so case 2 fires on the
     user's very next message after expiry, whenever that happens to be —
     it doesn't wait for a "new session".
 
-    Failure here (Razorpay API down, etc.) is logged and swallowed — it
+    Failure here (PhonePe API down, etc.) is logged and swallowed — it
     must never block or break the user's actual conversation.
     """
     try:
@@ -461,29 +469,41 @@ async def _maybe_send_premium_offer(
                     )
                     return
 
-        resent_existing_link = False
+        # Decide whether the last unpaid link can simply be re-sent. It can
+        # only be reused if we actually stored its URL (older rows may not
+        # have) AND it hasn't expired — PhonePe checkout URLs die after
+        # PHONEPE_LINK_EXPIRE_AFTER_SECONDS, so re-sending an old one would
+        # hand the user a dead link. Either miss falls through to creating a
+        # fresh order below.
+        reuse_existing_link = False
         if latest_link and latest_link.get("status") != "paid" and force_resend:
+            link_created_at = latest_link.get("created_at")
+            link_age_seconds = None
+            if link_created_at is not None:
+                if link_created_at.tzinfo is not None:
+                    link_created_at = link_created_at.replace(tzinfo=None)
+                link_age_seconds = (datetime.utcnow() - link_created_at).total_seconds()
+
+            if not latest_link.get("short_url"):
+                logger.info(
+                    f"↩️ Existing unpaid link for {phone_number} has no stored URL — "
+                    f"creating a fresh one."
+                )
+            elif link_age_seconds is None or not link_is_still_valid(link_age_seconds):
+                logger.info(
+                    f"⏳ Existing unpaid link for {phone_number} has expired "
+                    f"(age={link_age_seconds}s) — creating a fresh one."
+                )
+            else:
+                reuse_existing_link = True
+
+        resent_existing_link = False
+        if reuse_existing_link:
 
             logger.info(f"🔁 Explicit request — resending existing unpaid link for {phone_number}.")
 
             link = {"id": latest_link["payment_link_id"], "short_url": latest_link.get("short_url")}
             resent_existing_link = True
-            if not link["short_url"]:
-                # Older rows/back-compat safety: if short_url wasn't
-                # stored for some reason, fall back to creating a fresh
-                # link rather than sending a message with no URL in it.
-                link = await create_payment_link(
-                    phone_number=phone_number,
-                    amount_rupees=settings.PREMIUM_PLAN_AMOUNT_RUPEES,
-                    description=f"AI Health Assistant — {settings.PREMIUM_PLAN_DAYS}-day Premium",
-                )
-                await asyncio.to_thread(
-                    memory.save_payment_link,
-                    link["id"],
-                    phone_number,
-                    settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
-                    link.get("short_url"),
-                )
         else:
             logger.info(f"🆕 No active premium for {phone_number} — sending premium offer.")
             link = await create_payment_link(
@@ -740,47 +760,59 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok"}
 
 
-# Razorpay webhook — fires on payment.captured / payment_link.paid events.
-# Configure this URL in Razorpay Dashboard -> Settings -> Webhooks, and set
-# the same secret you enter there as RAZORPAY_WEBHOOK_SECRET in .env.
-@app.post("/razorpay/webhook")
-async def razorpay_webhook(request: Request):
+# PhonePe webhook — fires on checkout.order.completed / checkout.order.failed.
+# Configure this URL in the PhonePe Business Dashboard -> Webhooks, and set the
+# same username/password you enter there as PHONEPE_WEBHOOK_USERNAME and
+# PHONEPE_WEBHOOK_PASSWORD in .env.
+@app.post("/phonepe/webhook")
+async def phonepe_webhook(request: Request):
     raw = await request.body()
-    signature = request.headers.get("X-Razorpay-Signature", "")
+    authorization = request.headers.get("Authorization", "")
 
-    if not verify_webhook_signature(raw, signature):
-        logger.warning("⛔ Razorpay webhook: invalid signature — rejecting.")
+    if not verify_webhook_authorization(authorization):
+        logger.warning("⛔ PhonePe webhook: invalid authorization — rejecting.")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     try:
         body = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("Razorpay webhook: invalid JSON body.")
+        logger.warning("PhonePe webhook: invalid JSON body.")
         return {"status": "ok"}
 
     event = body.get("event", "")
-    logger.info(f"💰 Razorpay webhook event: {event}")
-
-
-    if event != "payment_link.paid":
-        return {"status": "ok"}
+    logger.info(f"💰 PhonePe webhook event: {event}")
 
     try:
         payload = body["payload"]
-        payment_link_entity = payload["payment_link"]["entity"]
-        payment_entity = payload["payment"]["entity"]
 
-        payment_link_id = payment_link_entity["id"]
-        razorpay_payment_id = payment_entity["id"]
+        # PhonePe advises trusting payload.state over the event name for the
+        # actual outcome, so we require both to say the order succeeded.
+        state = payload.get("state")
+        if event != "checkout.order.completed" or state != "COMPLETED":
+            logger.info(f"PhonePe webhook: ignoring event={event} state={state}.")
+            return {"status": "ok"}
+
+        # merchantOrderId is the id WE generated in create_payment_link, so
+        # this is a direct primary-key lookup on payment_links.
+        payment_link_id = payload["merchantOrderId"]
+
+        # Prefer the actual transaction id from the payment attempt; fall back
+        # to PhonePe's order id if paymentDetails is absent.
+        payment_details = payload.get("paymentDetails") or []
+        phonepe_transaction_id = (
+            payment_details[0].get("transactionId")
+            if payment_details and isinstance(payment_details[0], dict)
+            else None
+        ) or payload.get("orderId")
     except (KeyError, TypeError) as e:
-        logger.error(f"❌ Razorpay webhook: unexpected payload shape: {e} | body={body}")
+        logger.error(f"❌ PhonePe webhook: unexpected payload shape: {e} | body={body}")
         return {"status": "ok"}
 
     phone_number = await asyncio.to_thread(
-        memory.mark_payment_link_paid, payment_link_id, razorpay_payment_id
+        memory.mark_payment_link_paid, payment_link_id, phonepe_transaction_id
     )
     if not phone_number:
-        logger.warning(f"⚠️ Razorpay webhook: no local record for payment_link_id={payment_link_id}")
+        logger.warning(f"⚠️ PhonePe webhook: no local record for merchantOrderId={payment_link_id}")
         return {"status": "ok"}
 
     expires_at = await asyncio.to_thread(
@@ -805,7 +837,7 @@ async def razorpay_webhook(request: Request):
     except Exception as e:
         # Subscription is already activated in DB even if this confirmation
         # message fails to send — don't let a WhatsApp API hiccup undo the
-        # payment activation or make the webhook look like it failed to Razorpay.
+        # payment activation or make the webhook look like it failed to PhonePe.
         logger.error(f"❌ Failed to send payment confirmation to {phone_number}: {e}", exc_info=True)
 
 
@@ -815,6 +847,38 @@ async def razorpay_webhook(request: Request):
         logger.error(f"❌ Failed to start onboarding for {phone_number}: {e}", exc_info=True)
 
     return {"status": "ok"}
+
+
+# Where PhonePe sends the user's browser once they finish (or abandon) checkout.
+# PhonePe requires a redirectUrl on every order, but this page is purely
+# informational: activation happens in /phonepe/webhook, which is the only
+# thing we trust. Set PHONEPE_REDIRECT_URL to this endpoint's public URL.
+@app.api_route("/phonepe/redirect", methods=["GET", "POST"], response_class=HTMLResponse)
+async def phonepe_redirect():
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Payment status</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           display: flex; align-items: center; justify-content: center; min-height: 100vh;
+           margin: 0; background: #f5f6f8; color: #1c1e21; text-align: center; }
+    .card { background: #fff; padding: 32px 28px; border-radius: 12px; max-width: 380px;
+            box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    p { font-size: 15px; line-height: 1.5; margin: 0; color: #4b4f56; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Thanks! We're confirming your payment.</h1>
+    <p>You can close this page and head back to WhatsApp &mdash;
+       we'll message you there as soon as your plan is active.</p>
+  </div>
+</body>
+</html>"""
 
 
 async def _handle_incoming(raw_msg: dict) -> None:

@@ -28,7 +28,7 @@ pip install -r requirements.txt
 
 2. Copy or create your environment file
 
-Place configuration values in `.env` at the repository root. Example variables used by the app include WhatsApp keys, Redis URL, and Razorpay credentials. (See `app/config.py`.)
+Place configuration values in `.env` at the repository root. Example variables used by the app include WhatsApp keys, Redis URL, and PhonePe credentials. (See `app/config.py`.)
 
 3. Run the app locally
 
@@ -97,7 +97,7 @@ This will build the image(s) and run services as configured in `docker-compose.y
   - `api/` — FastAPI webhook receiver and HTTP entrypoint (`main.py`)
   - `core/` — core infrastructure (config, queues, idempotency, redis, kafka)
   - `models/` — domain models and Pydantic schemas (`schemas.py`)
-  - `services/` — business logic and external integrations (LLM, WhatsApp, Razorpay, audio processing, memory, onboarding)
+  - `services/` — business logic and external integrations (LLM, WhatsApp, PhonePe, audio processing, memory, onboarding)
   - `workers/` — background worker processes (inbound, outbound, dead letter)
 
 ## Configuration
@@ -106,7 +106,9 @@ Put all runtime secrets and settings in `.env` (root). Typical entries:
 
 - `REDIS_URL` — Redis connection string
 - `WHATSAPP_API_TOKEN` — WhatsApp API token/credentials
-- `RAZORPAY_KEY` / `RAZORPAY_SECRET` — payment provider credentials
+- `PHONEPE_CLIENT_ID` / `PHONEPE_CLIENT_SECRET` / `PHONEPE_CLIENT_VERSION` — payment provider credentials
+- `PHONEPE_WEBHOOK_USERNAME` / `PHONEPE_WEBHOOK_PASSWORD` — webhook credentials set in the PhonePe dashboard
+- `PHONEPE_REDIRECT_URL` — public URL of the `/phonepe/redirect` page
 - `OPENAI_API_KEY` (or equivalent) — LLM provider key
 
 Check `app/config.py` for the full list of environment variables the app expects.

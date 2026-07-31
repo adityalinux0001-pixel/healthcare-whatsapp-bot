@@ -175,7 +175,7 @@ class ConversationMemory:
                     phone_number TEXT NOT NULL,
                     amount_paise INTEGER NOT NULL,
                     status TEXT NOT NULL DEFAULT 'created',
-                    razorpay_payment_id TEXT,
+                    phonepe_transaction_id TEXT,
                     short_url TEXT,
                     created_at TIMESTAMPTZ DEFAULT now(),
                     paid_at TIMESTAMPTZ
@@ -184,6 +184,32 @@ class ConversationMemory:
 
             cur.execute('''
                 ALTER TABLE payment_links ADD COLUMN IF NOT EXISTS short_url TEXT
+            ''')
+
+            # Migration: databases created before the Razorpay -> PhonePe switch
+            # have this column under its old name. Postgres has no
+            # "RENAME COLUMN IF EXISTS", so the rename is guarded by a catalog
+            # check — making this block safe to run on every startup, like the
+            # ADD COLUMN IF NOT EXISTS statements around it.
+            cur.execute('''
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'payment_links'
+                          AND column_name = 'razorpay_payment_id'
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'payment_links'
+                          AND column_name = 'phonepe_transaction_id'
+                    ) THEN
+                        ALTER TABLE payment_links
+                        RENAME COLUMN razorpay_payment_id TO phonepe_transaction_id;
+                    END IF;
+                END $$;
+            ''')
+            cur.execute('''
+                ALTER TABLE payment_links ADD COLUMN IF NOT EXISTS phonepe_transaction_id TEXT
             ''')
             cur.execute('''
                 CREATE INDEX IF NOT EXISTS idx_payment_links_phone
@@ -519,7 +545,7 @@ class ConversationMemory:
             return (datetime.utcnow() - last).total_seconds()
 
     # ------------------------------------------------------------------
-    # Razorpay payments
+    # PhonePe payments
     # ------------------------------------------------------------------
 
     def save_payment_link(
@@ -563,7 +589,7 @@ class ConversationMemory:
             row = cur.fetchone()
             return dict(row) if row else None
 
-    def mark_payment_link_paid(self, payment_link_id: str, razorpay_payment_id: str) -> Optional[str]:
+    def mark_payment_link_paid(self, payment_link_id: str, phonepe_transaction_id: str) -> Optional[str]:
         with self._get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -578,9 +604,9 @@ class ConversationMemory:
                 return phone_number
             cur.execute('''
                 UPDATE payment_links
-                SET status = 'paid', razorpay_payment_id = %s, paid_at = %s
+                SET status = 'paid', phonepe_transaction_id = %s, paid_at = %s
                 WHERE payment_link_id = %s
-            ''', (razorpay_payment_id, datetime.utcnow(), payment_link_id))
+            ''', (phonepe_transaction_id, datetime.utcnow(), payment_link_id))
             conn.commit()
             return phone_number
 

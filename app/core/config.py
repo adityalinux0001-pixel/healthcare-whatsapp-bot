@@ -9,7 +9,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="forbid",
+        extra="ignore",
     )
 
     # WhatsApp Configuration
@@ -59,9 +59,26 @@ class Settings(BaseSettings):
 
     KAFKA_WORKER_MAX_CONCURRENT: int = 6
 
-    RAZORPAY_KEY_ID: str = ""
-    RAZORPAY_KEY_SECRET: str = ""
-    RAZORPAY_WEBHOOK_SECRET: str = ""
+    # --- PhonePe PG (Standard Checkout v2) ---
+    PHONEPE_CLIENT_ID: str = ""
+    PHONEPE_CLIENT_SECRET: str = ""
+    PHONEPE_CLIENT_VERSION: str = "1"
+
+    # "production" or "sandbox" — selects the PhonePe API host.
+    PHONEPE_ENV: str = "production"
+
+    # Webhook credentials configured in the PhonePe dashboard. PhonePe sends
+    # SHA256("<username>:<password>") in the Authorization header.
+    PHONEPE_WEBHOOK_USERNAME: str = ""
+    PHONEPE_WEBHOOK_PASSWORD: str = ""
+
+    # Where PhonePe sends the user's browser after payment. Informational only
+    # — the webhook remains the source of truth for activating a subscription.
+    PHONEPE_REDIRECT_URL: str = ""
+
+    # How long a PhonePe checkout URL stays payable. Unlike a Razorpay payment
+    # link, these expire; we regenerate rather than re-send a dead link.
+    PHONEPE_LINK_EXPIRE_AFTER_SECONDS: int = 3600
 
     # Premium plan shown as the upsell at the start of a new conversation.
     PREMIUM_PLAN_AMOUNT_RUPEES: int = 499
