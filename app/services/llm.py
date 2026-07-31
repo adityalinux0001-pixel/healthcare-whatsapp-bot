@@ -977,14 +977,41 @@ Write today's check-in message following the rules exactly.
 
 PLAN_CATEGORY_PROMPTS: dict[str, str] = {
     "weight_loss": """
-You are a practical health coach building a progressive {total_days}-day WhatsApp weight-loss micro-coaching plan based on the onboarding data below. This provides safe habit nudges, not medical prescriptions.
+You are a practical health coach building a progressive {total_days}-day WhatsApp weight-loss coaching plan based on the onboarding data below. This is a structured, evidence-informed behavior-change program — grounded in real clinical weight-management guidance (CDC lifestyle-change program principles and the NHLBI/NIH obesity treatment guidelines) — not medical prescriptions, not a crash diet, and not a generic tip-of-the-day list.
+
+Grounding facts to build every day's guidance on (do not state these as raw facts to the user — apply them, don't lecture):
+- Healthy, sustainable weight loss is about 1-2 lb (0.5-1 kg) per week, coming from a moderate daily energy deficit built through food choices and movement — never frame anything as rapid or extreme loss.
+- Small, specific, trackable actions compound. Self-monitoring (food/water/sleep/mood logging) in the early days measurably improves outcomes because it builds awareness before it builds change.
+- Movement adherence is higher when broken into short bouts (e.g., three 10-minute walks) rather than demanding one long session, especially early on or when time is limited.
+- Early, achievable wins build momentum; guidance should never front-load the hardest asks.
+- Long-term success depends on habit and identity change (what a person consistently does), not willpower spikes — so plateaus, slip-ups, and real-life disruptions (travel, parties, stress, cravings) must be planned for, not treated as failure.
+
+Program arc — the plan MUST progress through these three phases across the {total_days} days (split roughly into thirds; adjust boundaries slightly if {total_days} isn't divisible by 3):
+
+PHASE 1 — AWARENESS & BASELINE (first third):
+- Focus: self-monitoring, noticing current patterns, identifying personal obstacles (schedule, cravings, social pressure, sleep), and ONE small, low-friction swap at a time.
+- Tone: gentle, curious, zero pressure. No big asks. This phase builds the habit of paying attention, not the habit of restriction.
+
+PHASE 2 — BUILDING CORE HABITS (middle third):
+- Focus: structured movement matched to their stated time limit and physical constraints (broken into short bouts where useful), protein- and fiber-forward food swaps, consistent meal timing, hydration, and sleep hygiene.
+- Tone: encouraging and a little more structured — this is where real behavior change is being built, day over day, referencing what earlier days already established.
+
+PHASE 3 — CONSOLIDATION & MINDSET (final third):
+- Focus: handling setbacks and plateaus without spiraling, navigating real-life situations (eating out, travel, stress-eating, low-motivation days), and locking in the habits that should continue after Day {total_days}.
+- Tone: resilience-focused and forward-looking — helping them own the change as their own, not something that ends when the plan ends.
+
+Message quality requirements (this is what makes each day feel like real coaching, not a random tip):
+- Every message should briefly connect the ONE action to why it matters in plain, non-clinical language (e.g., grounding it in momentum, energy, consistency, or how the body responds) — one short reason, not a lecture.
+- Give exactly ONE specific, concrete, doable action per day. Never vague ("eat healthier", "be more active") — always a specific swap, a specific movement, a specific check-in, or a specific reflection prompt.
+- Each day must clearly build on or connect to what came before within its phase, so the plan reads as one coherent 21-day arc, not {total_days} unrelated tips.
+- Reference the plan's day number and phase-appropriate framing (e.g., early days = "let's just notice", later days = "you've already built X, now let's add Y") so continuity is felt.
 
 Safety & Customization Rules:
-- Adhere strictly to any listed injuries, medical conditions, or physical restrictions (e.g., no high-impact moves if knee pain is noted). Keep guidance safe and generic for chronic conditions (PCOS, diabetes, thyroid).
+- Adhere strictly to any listed injuries, medical conditions, or physical restrictions (e.g., no high-impact moves if knee pain is noted). Keep guidance safe and generic for chronic conditions (PCOS, diabetes, thyroid) — never contradict a doctor's plan, always defer to one for anything medical.
 - Fully respect all dietary preferences and restrictions.
 - Match their daily time constraints (e.g., do not exceed 15 mins if that is their stated limit).
-- Avoid specific calorie/macro prescriptions; provide general guidance only.
-- Do not repeat identical suggestions. Progressively vary the focus across movement, food swaps, mindset, and sleep over the {total_days} days. Avoid strategies they explicitly noted disliking.
+- NEVER prescribe specific calorie counts, macro targets, or numeric weight-loss targets/timelines to the user — the 1-2 lb/week pace above is for your own internal calibration of tone and ambition only, not something to state as a number/promise to the user.
+- Do not repeat identical suggestions across the {total_days} days. Progressively vary the focus across movement, food swaps, mindset, sleep, and reflection within each phase. Avoid strategies they explicitly noted disliking.
 """,
 }
 
@@ -998,7 +1025,7 @@ _PLAN_OUTPUT_FORMAT_INSTRUCTIONS = """
 [OUTPUT FORMAT — FOLLOW EXACTLY]
 Respond ONLY with a single JSON array containing exactly {total_days} objects corresponding to each ordered day. No markdown fences, preambles, or trailing text. Each object must contain exactly these two keys:
 
-  "message": A plain-text WhatsApp message (2-5 sentences, in {language}). Friendly, conversational tone decorated with 2-3 well-placed emojis (e.g., 💪, 🥗, 🎯). Vary emoji combinations day-to-day to avoid repetition. Never replace text clarity with symbols.
+  "message": A plain-text WhatsApp message (4-7 sentences, in {language}) — long enough to feel like genuine, descriptive coaching rather than a one-line tip. Structure it as: (1) a brief natural reference to today/their progress, (2) the ONE specific action for today stated clearly, (3) one short "why this matters" line connecting it to momentum, energy, or consistency, and (4) a brief note on how to actually do it today (timing, a simple substitution, or a way to make it easier). Friendly, conversational, genuinely encouraging tone decorated with 2-3 well-placed emojis (e.g., 💪, 🥗, 🎯). Vary emoji combinations day-to-day to avoid repetition. Never replace text clarity with symbols, and never state calorie counts, macro numbers, or specific weight-loss amounts/timelines.
   "followup_question": A short, single-sentence engagement question (in {language}) decorated with exactly ONE relevant emoji, designed to check in on their progress later that day. Do not reference this question inside the "message".
 
 Example structure:
@@ -1129,3 +1156,116 @@ Generate the full {total_days}-day JSON plan now, following the rules and format
         f"(language={language})."
     )
     return days
+
+
+async def _classify_onboarding_answer(
+    client: "genai.Client",
+    question_text: str,
+    user_text: str,
+) -> dict:
+    """
+    Small, isolated Gemini call used ONLY during onboarding
+    (app/services/onboarding.py). Decides whether the user's reply is a
+    genuine attempt to answer the CURRENT onboarding question, or
+    off-topic text (greetings, small talk, random questions, complaints,
+    anything else) that should NOT be saved as the answer.
+
+    Same pattern as _classify_premium_intent/_detect_reply_language: a
+    single tightly-scoped call given only the current question + current
+    reply (not the full onboarding history), kept cheap and fast.
+
+    When the reply is off-topic, this ALSO generates the short, warm
+    acknowledgment message to send back to the user in the SAME call, so
+    an off-topic reply costs exactly one Gemini call, not two.
+
+    Returns a dict:
+      {
+        "is_answer": bool,        # True if this genuinely answers the
+                                    # current question and should be saved
+        "acknowledgment": str,     # only meaningful when is_answer is
+                                    # False - a brief, friendly reply to
+                                    # whatever the user actually said
+      }
+
+    On any failure (network/API error, unparsable response), falls back
+    to {"is_answer": True, "acknowledgment": ""} - i.e. fail OPEN. If we
+    can't classify, treating the reply as a real answer and moving on
+    keeps onboarding from ever getting stuck in a loop; the worst case is
+    an occasional imperfect answer reaching the plan generator, which is
+    far less disruptive than a user being unable to progress at all.
+    """
+    stripped = user_text.strip()
+    if not stripped:
+        return {"is_answer": True, "acknowledgment": ""}
+
+    contents_text = (
+        f"QUESTION asked to the user:\n{question_text.strip()[:500]}\n\n"
+        f"USER's reply:\n{stripped[:500]}"
+    )
+
+    try:
+        response = await _call_gemini(
+            lambda: client.aio.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Part(text=contents_text)],
+                config=types.GenerateContentConfig(
+                    system_instruction=(
+                        "You are checking replies during a WhatsApp health "
+                        "coach's onboarding flow, where the user is asked a "
+                        "fixed sequence of profile questions one at a time.\n\n"
+                        "Decide: does the user's reply genuinely attempt to "
+                        "answer the QUESTION asked (even if brief, informal, "
+                        "or incomplete)? Judge substance, not politeness or "
+                        "grammar.\n"
+                        "- TRUE if it's a real attempt at the requested info, "
+                        "even if partial, vague, or in another language.\n"
+                        "- FALSE if it's a greeting ('hi', 'hello'), small "
+                        "talk ('how are you'), an unrelated question, a "
+                        "complaint, or otherwise doesn't address the "
+                        "question at all.\n\n"
+                        "If FALSE, also write a short acknowledgment "
+                        "(max 2 short sentences, warm and natural, 0-1 "
+                        "emoji) that directly responds to what the user "
+                        "said, then gently reminds them the question is "
+                        "still waiting. Do NOT restate the full original "
+                        "question text in the acknowledgment — just the "
+                        "reminder (e.g. 'still need that from you above' "
+                        "or 'whenever you're ready to answer that'). If "
+                        "TRUE, leave acknowledgment as an empty string.\n\n"
+                        "Respond ONLY with a raw JSON object (no markdown, "
+                        "no explanations):\n"
+                        '{"is_answer": true|false, "acknowledgment": "..."}'
+                    ),
+                    max_output_tokens=200,
+                    temperature=0.4,
+                ),
+            ),
+            label="onboarding answer classification",
+        )
+        raw = (response.text or "").strip()
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        parsed = _json.loads(raw)
+        is_answer = bool(parsed.get("is_answer", True))
+        acknowledgment = str(parsed.get("acknowledgment", "") or "").strip()
+        return {"is_answer": is_answer, "acknowledgment": acknowledgment}
+    except Exception as e:
+        logger.warning(
+            f"Onboarding answer classification failed, defaulting to "
+            f"is_answer=True (fail open): {e}"
+        )
+        return {"is_answer": True, "acknowledgment": ""}
+
+
+async def classify_onboarding_answer(
+    question_text: str,
+    user_text: str,
+) -> dict:
+    """
+    Public wrapper around _classify_onboarding_answer() for callers
+    outside this module (app/services/onboarding.py). See that
+    function's docstring for the full rationale and return shape.
+    """
+    client = _get_client()
+    return await _classify_onboarding_answer(client, question_text, user_text)

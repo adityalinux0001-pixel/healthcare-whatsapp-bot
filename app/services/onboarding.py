@@ -35,7 +35,12 @@ from typing import Optional
 
 from app.core.config import get_settings
 from app.services.memory import ConversationMemory
-from app.services.llm import generate_premium_plan, detect_reply_language, GeminiUnavailableError
+from app.services.llm import (
+    generate_premium_plan,
+    detect_reply_language,
+    classify_onboarding_answer,
+    GeminiUnavailableError,
+)
 from app.services.whatsapp import send_text_message
 
 logger = logging.getLogger(__name__)
@@ -144,6 +149,173 @@ def _parse_preferred_hour_to_utc(user_text: str) -> Optional[int]:
         return hour % 24
     # Convert from assumed IST to UTC.
     return int((hour - _IST_OFFSET_HOURS) % 24)
+
+
+# ---------------------------------------------------------------------------
+# Strict validators
+#
+# Only questions whose answers feed real downstream calculations (BMI/plan
+# math for weight_height, scheduler hour for preferred_checkin_time) get a
+# hard regex/format check here. Everything else (goal, diet, activity_level,
+# medical_conditions, routine_time, past_attempts) stays free-text, gated
+# only by classify_onboarding_answer's LLM judgment as before.
+#
+# Each validator returns (parsed_value, error_message):
+#   - success:  (parsed_value, None)
+#   - failure:  (None, "<short, friendly, WhatsApp-ready error message>")
+#
+# On failure, handle_onboarding_reply re-sends the error + the SAME
+# question, without advancing and without calling the LLM classifier.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_WEIGHT_KG_RE = _re.compile(r"(\d{2,3}(?:\.\d+)?)\s*(?:kgs?|kilograms?)\b", _re.IGNORECASE)
+_WEIGHT_LB_RE = _re.compile(r"(\d{2,3}(?:\.\d+)?)\s*(?:lbs?|pounds?)\b", _re.IGNORECASE)
+_HEIGHT_CM_RE = _re.compile(r"(\d{2,3}(?:\.\d+)?)\s*(?:cms?|centimeters?|centimetres?)\b", _re.IGNORECASE)
+_HEIGHT_M_RE = _re.compile(r"(\d(?:\.\d+))\s*m\b", _re.IGNORECASE)
+_HEIGHT_FT_IN_RE = _re.compile(
+    r"(\d)\s*(?:'|ft|feet)\s*(\d{1,2})?\s*(?:\"|in|inches)?", _re.IGNORECASE
+)
+
+
+def _parse_weight_height(user_text: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Strictly parse a free-text reply like "72kg, 165cm", "72 kg 5'5\"",
+    "158 lbs, 5 ft 6 in" into {"weight_kg": float, "height_cm": float}.
+
+    Requires BOTH a weight and a height to be unambiguously present with
+    units; sanity-range checked (weight 25-300kg, height 100-250cm) to
+    catch typos. Returns (None, error_message) if either is missing,
+    unparseable, or out of range.
+    """
+    text = user_text.strip().lower()
+
+    weight_kg: Optional[float] = None
+    m = _WEIGHT_KG_RE.search(text)
+    if m:
+        weight_kg = float(m.group(1))
+    else:
+        m = _WEIGHT_LB_RE.search(text)
+        if m:
+            weight_kg = float(m.group(1)) * 0.45359237
+
+    height_cm: Optional[float] = None
+    m = _HEIGHT_CM_RE.search(text)
+    if m:
+        height_cm = float(m.group(1))
+    else:
+        m = _HEIGHT_M_RE.search(text)
+        if m:
+            height_cm = float(m.group(1)) * 100
+        else:
+            m = _HEIGHT_FT_IN_RE.search(text)
+            if m:
+                feet = int(m.group(1))
+                inches = int(m.group(2)) if m.group(2) else 0
+                height_cm = (feet * 12 + inches) * 2.54
+
+    if weight_kg is None or height_cm is None:
+        missing = []
+        if weight_kg is None:
+            missing.append("weight (with kg or lbs)")
+        if height_cm is None:
+            missing.append("height (with cm, m, or ft/in)")
+        return None, (
+            "Hmm, I couldn't quite catch your " + " and ".join(missing) + " 🤔\n\n"
+            "Please include units, e.g. \"72kg, 165cm\" or \"158 lbs, 5 ft 6 in\"."
+        )
+
+    if not (25 <= weight_kg <= 300):
+        return None, (
+            "That weight looks off to me — please double check and resend, "
+            "e.g. \"72kg, 165cm\"."
+        )
+    if not (100 <= height_cm <= 250):
+        return None, (
+            "That height looks off to me — please double check and resend, "
+            "e.g. \"72kg, 165cm\"."
+        )
+
+    return {"weight_kg": round(weight_kg, 1), "height_cm": round(height_cm, 1)}, None
+
+
+def _parse_checkin_time_strict(user_text: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Strict wrapper around _parse_preferred_hour_to_utc: unlike the
+    fail-open fallback used at plan-generation time, onboarding itself
+    now REQUIRES a parseable time and re-asks if it can't find one,
+    rather than silently defaulting.
+    """
+    hour_utc = _parse_preferred_hour_to_utc(user_text)
+    if hour_utc is None:
+        return None, (
+            "I couldn't quite figure out a time from that 🤔\n\n"
+            "Please reply with something like \"8am\", \"9:30 pm\", or "
+            "\"7 in the morning\" (your local time, IST by default)."
+        )
+    return {"checkin_hour_utc": hour_utc}, None
+
+
+# Maps onboarding answer key -> strict validator function. Only keys
+# present here get strict validation; all other keys are untouched.
+_STRICT_VALIDATORS = {
+    "weight_height": _parse_weight_height,
+    "preferred_checkin_time": _parse_checkin_time_strict,
+}
+
+
+# ---------------------------------------------------------------------------
+# Minimal-effort filter (applies to the free-text questions that have no
+# strict validator above, i.e. everything except weight_height and
+# preferred_checkin_time: goal, diet, activity_level, medical_conditions,
+# routine_time, past_attempts).
+#
+# This is a cheap, deterministic pre-check that runs BEFORE the LLM
+# classifier. It only screens out replies that are too short / low-content
+# to plausibly be a real answer (e.g. "idk", "x", "??", a single emoji) —
+# it does NOT judge topical relevance, that's still classify_onboarding_
+# answer's job. Genuinely short-but-valid answers ("vegan", "none", "20
+# min") are explicitly allowed via a short whitelist + length floor, so
+# this stays a low-effort filter, not a strictness filter.
+# ---------------------------------------------------------------------------
+
+_LOW_EFFORT_PHRASES = {
+    "idk", "dunno", "dont know", "don't know", "whatever", "anything",
+    "who knows", "not sure", "no idea", "meh", "idc", "shrug",
+}
+
+_MIN_CONTENT_CHARS = 2  # after stripping punctuation/whitespace/emoji
+
+
+def _looks_low_effort(user_text: str) -> bool:
+    """
+    True if the reply is too thin to be a genuine answer attempt: empty,
+    a single low-info word/phrase, or almost no alphanumeric content
+    (e.g. just punctuation or an emoji). Short legitimate answers like
+    "vegan", "none", or "20 min" pass through untouched.
+    """
+    stripped = user_text.strip().lower()
+    if not stripped:
+        return True
+
+    # Strip common trailing punctuation for the phrase check.
+    normalized = stripped.strip(" .!?,;:'\"")
+    if normalized in _LOW_EFFORT_PHRASES:
+        return True
+
+    # Count actual letters/digits — filters out "??", "...", lone emoji,
+    # or other near-empty replies while letting "20 min" or "5'5" through.
+    alnum_chars = sum(ch.isalnum() for ch in stripped)
+    if alnum_chars < _MIN_CONTENT_CHARS:
+        return True
+
+    return False
+
+
+_LOW_EFFORT_RETRY_MESSAGE = (
+    "I need a bit more to go on for this one 🙏\n\n"
+)
 
 
 async def start_onboarding(
@@ -320,13 +492,79 @@ async def handle_onboarding_reply(
         await _finish_onboarding_and_generate_plan(memory, phone_number)
         return True
 
-    current_key, _ = questions[question_index]
-    new_index = await asyncio.to_thread(
-        memory.save_onboarding_answer, phone_number, current_key, user_text
-    )
+    current_key, current_prompt = questions[question_index]
 
     await asyncio.to_thread(
         memory.save_message, phone_number, "user", user_text, message_type="text"
+    )
+
+    # Strict gate FIRST: for keys with a registered validator (currently
+    # weight_height and preferred_checkin_time — see _STRICT_VALIDATORS),
+    # the reply must parse into a well-formed value before we even
+    # consider it an "answer". Failing this is a hard re-ask with a
+    # specific format hint, unlike the LLM gate below, and skips the LLM
+    # classifier call entirely (no ambiguity to resolve — it's just
+    # unparseable).
+    validator = _STRICT_VALIDATORS.get(current_key)
+    if validator is not None:
+        parsed_value, error_message = validator(user_text)
+        if error_message is not None:
+            reply_text = f"{error_message}\n\n{current_prompt}"
+            await send_text_message(phone_number, reply_text)
+            await asyncio.to_thread(
+                memory.save_message, phone_number, "assistant", reply_text, message_type="text"
+            )
+            return True
+        # Store the original text (kept human-readable / language-agnostic
+        # for the plan-generation LLM prompt downstream) — the parsed_value
+        # dict is what we've just confirmed IS extractable from it, used
+        # here only to gate acceptance. preferred_checkin_time's raw text
+        # is still what _parse_preferred_hour_to_utc re-parses later in
+        # _finish_onboarding_and_generate_plan.
+        new_index = await asyncio.to_thread(
+            memory.save_onboarding_answer, phone_number, current_key, user_text
+        )
+        if new_index >= len(questions):
+            await _finish_onboarding_and_generate_plan(memory, phone_number)
+            return True
+        next_key, next_prompt = questions[new_index]
+        await send_text_message(phone_number, next_prompt)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", next_prompt, message_type="text"
+        )
+        return True
+
+    # Minimal-effort gate (free-text questions only — Q1/Q8 already
+    # returned above via the strict validator branch). Cheap, deterministic
+    # rejection of near-empty replies like "idk" or "??" BEFORE spending an
+    # LLM call on them. Does not judge topical relevance — that's still the
+    # classifier's job right below.
+    if _looks_low_effort(user_text):
+        reply_text = f"{_LOW_EFFORT_RETRY_MESSAGE}{current_prompt}"
+        await send_text_message(phone_number, reply_text)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", reply_text, message_type="text"
+        )
+        return True
+
+    # Gate: only save + advance if this reply genuinely answers the
+    # CURRENT question. Off-topic replies (greetings, small talk, random
+    # questions, etc.) are acknowledged gracefully and the SAME question
+    # is re-sent, instead of being silently stored as the answer and
+    # skipped past — see classify_onboarding_answer's docstring for the
+    # fail-open rationale on classifier errors.
+    classification = await classify_onboarding_answer(current_prompt, user_text)
+    if not classification.get("is_answer", True):
+        acknowledgment = classification.get("acknowledgment") or "Got it 🙂"
+        reply_text = f"{acknowledgment}\n\n{current_prompt}"
+        await send_text_message(phone_number, reply_text)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", reply_text, message_type="text"
+        )
+        return True
+
+    new_index = await asyncio.to_thread(
+        memory.save_onboarding_answer, phone_number, current_key, user_text
     )
 
     if new_index >= len(questions):
