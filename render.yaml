@@ -220,7 +220,7 @@ services:
     region: oregon
     dockerfilePath: ./Dockerfile
     dockerCommand: python -m app.services.daily_checkin --once
-    schedule: "0 9 * * *"
+    schedule: "0 * * * *"
     envVars:
       - fromGroup: healthbot-secrets
       - key: DATABASE_URL
