@@ -67,6 +67,13 @@ services:
       mountPath: /var/lib/kafka/data
       sizeGB: 10
     envVars:
+      # Cap the JVM heap so Kafka fits inside the starter plan's 512MB
+      # container limit. Without this, Kafka's default heap sizing
+      # (often ~1GB) exceeds the container's total memory before a
+      # single log segment is even loaded, causing an immediate OOM
+      # kill right after "Launching kafka ...".
+      - key: KAFKA_HEAP_OPTS
+        value: "-Xmx256M -Xms256M"
       # Tell Render which port this private service actually listens on.
       # Without this, Render defaults to 10000 and every downstream
       # fromService/hostport reference (including the self-reference
