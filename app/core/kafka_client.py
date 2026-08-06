@@ -72,6 +72,15 @@ def get_producer() -> Producer:
                 "linger.ms": 20,
                 "compression.type": "lz4",
                 "enable.idempotence": True,
+
+                # Force periodic reconnect so we never hold a TCP socket
+                # open long enough to survive a Render IP remap (private
+                # service IPs can change across restarts/redeploys).
+                "connections.max.idle.ms": 60000,
+                "socket.keepalive.enable": True,
+                "broker.address.family": "v4",
+                "reconnect.backoff.ms": 200,
+                "reconnect.backoff.max.ms": 5000,
             }
         )
     return _producer
@@ -219,6 +228,14 @@ async def run_consumer_loop_async(
             "group.id": group_id,
             "auto.offset.reset": settings.KAFKA_CONSUMER_AUTO_OFFSET_RESET,
             "enable.auto.commit": False,
+
+            # See get_producer() above for why these matter on Render's
+            # private network.
+            "connections.max.idle.ms": 60000,
+            "socket.keepalive.enable": True,
+            "broker.address.family": "v4",
+            "reconnect.backoff.ms": 200,
+            "reconnect.backoff.max.ms": 5000,
         }
     )
     consumer.subscribe([topic])
@@ -383,6 +400,14 @@ def run_consumer_loop(
             # Commit offsets ourselves, after successful processing, not
             # automatically in the background — see docstring above.
             "enable.auto.commit": False,
+
+            # See get_producer() above for why these matter on Render's
+            # private network.
+            "connections.max.idle.ms": 60000,
+            "socket.keepalive.enable": True,
+            "broker.address.family": "v4",
+            "reconnect.backoff.ms": 200,
+            "reconnect.backoff.max.ms": 5000,
         }
     )
     consumer.subscribe([topic])
