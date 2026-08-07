@@ -58,61 +58,58 @@ services:
   - type: pserv
     name: healthbot-kafka
     runtime: image
-    plan: standard          # CHANGED: was "starter" (512MB) -> "standard" (1 CPU / 2GB)
-                             # matches the instance size already applied in the dashboard,
-                             # and gives enough headroom to stop the OOM-driven crash loop.
+    plan: standard
     region: oregon
+
     image:
       url: docker.io/confluentinc/cp-kafka:7.6.1
+
     disk:
       name: kafka-data
       mountPath: /var/lib/kafka/data
       sizeGB: 10
+
     envVars:
-      # ADDED: caps the JVM heap instead of letting it default off total
-      # container memory. ~50% of the 2GB standard instance, leaving the
-      # rest for Kafka's page cache (which Kafka relies on heavily) and
-      # off-heap/network buffers. This is the fix for the repeated
-      # crash/restart loop you were seeing.
+
       - key: KAFKA_HEAP_OPTS
         value: "-Xms512M -Xmx1G"
-      # Tell Render which port this private service actually listens on.
-      # Without this, Render defaults to 10000 and every downstream
-      # fromService/hostport reference (including the self-reference
-      # below) resolves to the wrong port.
-      - key: PORT
-        value: "9092"
+
       - key: KAFKA_NODE_ID
         value: "1"
+
       - key: KAFKA_PROCESS_ROLES
-        value: broker,controller
+        value: "broker,controller"
+
       - key: KAFKA_CONTROLLER_QUORUM_VOTERS
         value: "1@localhost:9093"
+
       - key: KAFKA_LISTENERS
-        value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
-      # CHANGED: was "PLAINTEXT://healthbot-kafka:9092" -> now uses the
-      # real current internal hostname "healthbot-kafka-tq0t" (confirmed
-      # in the Render dashboard's Service Addresses panel). Render can
-      # append a random suffix like "-tq0t" to a pserv's internal DNS
-      # name; the old hardcoded value no longer resolves, which is the
-      # root cause of every "Failed to resolve 'healthbot-kafka:9092'"
-      # error in your logs. Kafka requires the listener scheme
-      # (PLAINTEXT://) prefixed onto host:port, and fromService/hostport
-      # only returns the bare "host:port" with no scheme, which Kafka
-      # rejects at startup -- so this still has to be hardcoded, just
-      # with the correct hostname now.
+        value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://127.0.0.1:9093"
+
       - key: KAFKA_ADVERTISED_LISTENERS
         value: "PLAINTEXT://healthbot-kafka-tq0t:9092"
+
       - key: KAFKA_CONTROLLER_LISTENER_NAMES
-        value: CONTROLLER
+        value: "CONTROLLER"
+
       - key: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
         value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+
       - key: KAFKA_INTER_BROKER_LISTENER_NAME
-        value: PLAINTEXT
+        value: "PLAINTEXT"
+
       - key: CLUSTER_ID
         value: "YLnj4tsXRAmRERgTDjIoVA"
+
       - key: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
         value: "1"
+
+      - key: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+        value: "1"
+
+      - key: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+        value: "1"
+
       - key: KAFKA_AUTO_CREATE_TOPICS_ENABLE
         value: "true"
 
