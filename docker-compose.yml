@@ -29,41 +29,36 @@ services:
       timeout: 5s
       retries: 10
 
-kafka:
-  image: confluentinc/cp-kafka:7.6.1
-  restart: unless-stopped
-  ports:
-    - "9092:9092"
-
-  environment:
-    KAFKA_NODE_ID: 1
-    KAFKA_PROCESS_ROLES: broker,controller
-    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-
-    KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://127.0.0.1:9093
-    KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-
-    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-
-    CLUSTER_ID: "YLnj4tsXRAmRERgTDjIoVA"
-
-    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-
-    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-
-  volumes:
-    - kafka_data:/var/lib/kafka/data
-
-  healthcheck:
-    test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-    interval: 10s
-    timeout: 10s
-    retries: 15
-    start_period: 30s
+  # Kafka broker running in KRaft mode (no separate Zookeeper needed).
+  # Only used/needed when QUEUE_BACKEND=kafka; harmless (idle) otherwise.
+  # Single-broker setup for local/dev — for production, run a proper
+  # multi-broker cluster (Confluent Cloud, MSK, Redpanda, self-hosted
+  # multi-node, etc.) and just point KAFKA_BOOTSTRAP_SERVERS at it instead
+  # of running this service.
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      CLUSTER_ID: "YLnj4tsXRAmRERgTDjIoVA"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
 
   app:
     build: .
@@ -89,9 +84,45 @@ kafka:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # Inbound worker(s) — consume raw WhatsApp events (from Kafka, or from
+  # RQ/Celery/Huey depending on QUEUE_BACKEND) and run the core
+  # engines/APIs pipeline (LLM, transcription, vision, Postgres writes).
+  #
+  # IMPORTANT (RQ/Celery/Huey backends specifically): a single worker
+  # process handles ONE job at a time by design — Worker.work() /
+  # --concurrency=1 / workers=1 all mean exactly that. If only one
+  # `worker` replica is running, three different users messaging within
+  # the same second WILL be served strictly in arrival order, with users
+  # 2 and 3 waiting for user 1's entire reply (including the Gemini API
+  # round trip) to finish first. This is expected RQ/Celery/Huey
+  # behavior, not a bug in the app code — the fix is to run more worker
+  # replicas, e.g.:
+  #     docker-compose up --scale worker=4
+  # (`replicas: 4` below sets this as the default so it isn't
+  # accidentally left at 1; override via --scale at deploy time as
+  # needed). Each replica is an independent consumer pulling from the
+  # same queue, so they naturally process different users' jobs in
+  # parallel.
+  #
+  # The Kafka backend does NOT need multiple replicas for this same
+  # problem — a single Kafka worker process now handles multiple
+  # in-flight messages concurrently via asyncio tasks (see
+  # run_consumer_loop_async in app/kafka_client.py), since different
+  # users' messages land on different partitions anyway. Extra Kafka
+  # worker replicas are still useful for raw throughput/redundancy, just
+  # not required to fix the "first user blocks everyone else" symptom.
   worker:
     build: .
     restart: unless-stopped
+    # NOTE: `deploy.replicas` below only takes effect under `docker stack
+    # deploy` (Swarm mode). If you're running plain `docker-compose up`
+    # (e.g. via Docker Desktop, as most local/dev setups do), that field
+    # is silently ignored and you'll still only get 1 replica — you MUST
+    # pass --scale explicitly instead:
+    #     docker-compose up --scale worker=4
+    # Left the deploy.replicas hint here anyway for anyone who does
+    # eventually move to Swarm/a similar orchestrator.
     deploy:
       replicas: 4
     env_file:
@@ -110,6 +141,12 @@ kafka:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # Outbound worker — only does anything when QUEUE_BACKEND=kafka. Drains
+  # the outbound topic and performs the actual WhatsApp Cloud API calls,
+  # decoupled from inbound processing so a WhatsApp-side slowdown/rate
+  # limit can't back up message ingestion. Safe to leave running (exits
+  # immediately with a clear log message) when using a non-Kafka backend.
   outbound_worker:
     build: .
     restart: unless-stopped
@@ -125,6 +162,14 @@ kafka:
         condition: service_healthy
       kafka:
         condition: service_healthy
+
+  # Dead-letter replay worker — see dead_letter_worker.py's module
+  # docstring. Picks up any inbound message that failed to enqueue (after
+  # its own inline retries) and got persisted to the dead_letter_messages
+  # table instead of being lost, and keeps retrying it in the background
+  # until the underlying queue backend recovers. Single replica is
+  # intentional: dead-letter volume should be near-zero in steady state,
+  # so this doesn't need the same horizontal scaling as `worker`.
   dead_letter_worker:
     build: .
     restart: unless-stopped
@@ -151,7 +196,11 @@ kafka:
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://whatsapp_bot:whatsapp_bot@db:5432/whatsapp_bot
-
+    # Runs app/daily_checkin.py's built-in scheduler loop, which wakes up
+    # once a minute and sends that day's premium check-ins once per UTC
+    # day at DAILY_CHECKIN_HOUR_UTC (see app/config.py). Swap this command
+    # for `["python", "-m", "app.daily_checkin", "--once"]` on an external
+    # cron trigger instead, if you'd rather not run a long-lived loop.
     command: ["python", "-m", "app.services.daily_checkin"]
     depends_on:
       db:
