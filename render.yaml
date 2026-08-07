@@ -4,354 +4,247 @@ databases:
     region: oregon
     postgresMajorVersion: "16"
 
-
 envVarGroups:
   - name: healthbot-secrets
     envVars:
-
       - key: PHONE_NUMBER_ID
         sync: false
-
       - key: WHATSAPP_TOKEN
         sync: false
-
       - key: VERIFY_TOKEN
         sync: false
-
       - key: GEMINI_API_KEY
         sync: false
-
       - key: OPENAI_API_KEY
         sync: false
-
       - key: PHONEPE_CLIENT_ID
         sync: false
-
       - key: PHONEPE_CLIENT_SECRET
         sync: false
-
       - key: PHONEPE_CLIENT_VERSION
         sync: false
-
       - key: PHONEPE_ENV
         value: production
-
       - key: PHONEPE_WEBHOOK_USERNAME
         sync: false
-
       - key: PHONEPE_WEBHOOK_PASSWORD
         sync: false
-
       - key: PHONEPE_REDIRECT_URL
         sync: false
-
       - key: LOG_LEVEL
         value: INFO
-
       - key: MAX_HISTORY_TURNS
         value: "10"
-
       - key: PREMIUM_PLAN_AMOUNT_RUPEES
         value: "499"
-
       - key: PREMIUM_PLAN_DAYS
         value: "21"
-
       - key: QUEUE_BACKEND
         value: kafka
-
       - key: KAFKA_NUM_PARTITIONS
         value: "6"
-
       - key: KAFKA_WORKER_MAX_CONCURRENT
         value: "6"
 
-
 services:
-
-  # ==========================================================
-  # REDIS
-  # ==========================================================
-
+  # ---- Managed Redis (Render Key Value) ----
   - type: keyvalue
     name: healthbot-redis
     plan: starter
-    ipAllowList: []
+    ipAllowList: []          # private network only, no public access
     maxmemoryPolicy: noeviction
 
+  # ---- Self-hosted Kafka (single-broker KRaft mode) ----
+- type: pserv
+  name: healthbot-kafka
+  runtime: image
+  plan: standard
+  region: oregon
 
-  # ==========================================================
-  # KAFKA - SINGLE BROKER KRaft
-  # ==========================================================
+  image:
+    url: docker.io/confluentinc/cp-kafka:7.6.1
 
-  - type: pserv
-    name: healthbot-kafka
-    runtime: image
-    plan: standard
-    region: oregon
+  disk:
+    name: kafka-data
+    mountPath: /var/lib/kafka/data
+    sizeGB: 10
 
-    image:
-      url: docker.io/confluentinc/cp-kafka:7.6.1
+  envVars:
 
-    disk:
-      name: kafka-data
-      mountPath: /var/lib/kafka/data
-      sizeGB: 10
+    - key: KAFKA_HEAP_OPTS
+      value: "-Xms512M -Xmx1G"
 
-    envVars:
+    - key: KAFKA_NODE_ID
+      value: "1"
 
-      # Kafka JVM memory
-      - key: KAFKA_HEAP_OPTS
-        value: "-Xms512M -Xmx1G"
+    - key: KAFKA_PROCESS_ROLES
+      value: "broker,controller"
 
-      # KRaft
-      - key: KAFKA_NODE_ID
-        value: "1"
+    - key: KAFKA_CONTROLLER_QUORUM_VOTERS
+      value: "1@localhost:9093"
 
-      - key: KAFKA_PROCESS_ROLES
-        value: "broker,controller"
+    - key: KAFKA_LISTENERS
+      value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://127.0.0.1:9093"
 
-      - key: KAFKA_CONTROLLER_QUORUM_VOTERS
-        value: "1@localhost:9093"
+    - key: KAFKA_ADVERTISED_LISTENERS
+      value: "PLAINTEXT://healthbot-kafka-tq0t:9092"
 
-      # Broker listens on 9092
-      # Controller listens on 9093
-      - key: KAFKA_LISTENERS
-        value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://127.0.0.1:9093"
+    - key: KAFKA_CONTROLLER_LISTENER_NAMES
+      value: "CONTROLLER"
 
-      # IMPORTANT:
-      # Application clients connect to 9092.
-      # 9093 is controller-only.
-      - key: KAFKA_ADVERTISED_LISTENERS
-        value: "PLAINTEXT://healthbot-kafka-tq0t:9092"
+    - key: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+      value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
 
-      - key: KAFKA_CONTROLLER_LISTENER_NAMES
-        value: "CONTROLLER"
+    - key: KAFKA_INTER_BROKER_LISTENER_NAME
+      value: "PLAINTEXT"
 
-      - key: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-        value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+    - key: CLUSTER_ID
+      value: "YLnj4tsXRAmRERgTDjIoVA"
 
-      - key: KAFKA_INTER_BROKER_LISTENER_NAME
-        value: "PLAINTEXT"
+    - key: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+      value: "1"
 
-      # Existing cluster ID
-      - key: CLUSTER_ID
-        value: "YLnj4tsXRAmRERgTDjIoVA"
+    - key: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+      value: "1"
 
-      # Single broker
-      - key: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-        value: "1"
+    - key: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+      value: "1"
 
-      - key: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-        value: "1"
+    - key: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+      value: "true"
 
-      - key: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-        value: "1"
-
-      - key: KAFKA_AUTO_CREATE_TOPICS_ENABLE
-        value: "true"
-
-
-  # ==========================================================
-  # FASTAPI WEB SERVICE
-  # ==========================================================
-
+  # ---- Web service: FastAPI webhook receiver ----
   - type: web
     name: healthbot-web
     runtime: docker
     plan: starter
     region: oregon
-
     dockerfilePath: ./Dockerfile
-
     healthCheckPath: /health
-
     envVars:
-
       - fromGroup: healthbot-secrets
-
       - key: DATABASE_URL
         fromDatabase:
           name: healthbot-db
           property: connectionString
-
       - key: REDIS_URL
         fromService:
           type: keyvalue
           name: healthbot-redis
           property: connectionString
-
-      # Render automatically provides the Kafka
-      # private hostname + port.
-      #
-      # Example:
-      # healthbot-kafka-tq0t:9092
       - key: KAFKA_BOOTSTRAP_SERVERS
         fromService:
           type: pserv
           name: healthbot-kafka
           property: hostport
-
-      # FastAPI / Uvicorn
       - key: BIND
         value: "0.0.0.0:10000"
-
-      # Starter instance
       - key: WEB_CONCURRENCY
-        value: "1"
-
+        value: "8"
       - key: DB_POOL_MIN_SIZE
         value: "2"
-
       - key: DB_POOL_MAX_SIZE
         value: "8"
 
-
-  # ==========================================================
-  # INBOUND KAFKA WORKER
-  # ==========================================================
-
+  # ---- Inbound Kafka worker(s) ----
   - type: worker
     name: healthbot-inbound-worker
     runtime: docker
     plan: starter
     region: oregon
-
     dockerfilePath: ./Dockerfile
-
     dockerCommand: python -m app.workers.worker
-
     disk:
       name: audio-storage
       mountPath: /app/audio_storage
       sizeGB: 5
-
     envVars:
-
       - fromGroup: healthbot-secrets
-
       - key: DATABASE_URL
         fromDatabase:
           name: healthbot-db
           property: connectionString
-
       - key: REDIS_URL
         fromService:
           type: keyvalue
           name: healthbot-redis
           property: connectionString
-
       - key: KAFKA_BOOTSTRAP_SERVERS
         fromService:
           type: pserv
           name: healthbot-kafka
           property: hostport
 
-
-  # ==========================================================
-  # OUTBOUND KAFKA WORKER
-  # ==========================================================
-
+  # ---- Outbound Kafka worker ----
   - type: worker
     name: healthbot-outbound-worker
     runtime: docker
     plan: starter
     region: oregon
-
     dockerfilePath: ./Dockerfile
-
     dockerCommand: python -m app.workers.outbound_worker
-
     envVars:
-
       - fromGroup: healthbot-secrets
-
       - key: DATABASE_URL
         fromDatabase:
           name: healthbot-db
           property: connectionString
-
       - key: REDIS_URL
         fromService:
           type: keyvalue
           name: healthbot-redis
           property: connectionString
-
       - key: KAFKA_BOOTSTRAP_SERVERS
         fromService:
           type: pserv
           name: healthbot-kafka
           property: hostport
 
-
-  # ==========================================================
-  # DEAD LETTER WORKER
-  # ==========================================================
-
+  # ---- Dead-letter replay worker ----
   - type: worker
     name: healthbot-dead-letter-worker
     runtime: docker
     plan: starter
     region: oregon
-
     dockerfilePath: ./Dockerfile
-
     dockerCommand: python -m app.workers.dead_letter_worker
-
     envVars:
-
       - fromGroup: healthbot-secrets
-
       - key: DATABASE_URL
         fromDatabase:
           name: healthbot-db
           property: connectionString
-
       - key: REDIS_URL
         fromService:
           type: keyvalue
           name: healthbot-redis
           property: connectionString
-
       - key: KAFKA_BOOTSTRAP_SERVERS
         fromService:
           type: pserv
           name: healthbot-kafka
           property: hostport
 
-
-  # ==========================================================
-  # DAILY CHECK-IN
-  # ==========================================================
-
+  # ---- Daily premium check-in (cron, runs once/day) ----
   - type: cron
     name: healthbot-daily-checkin
     runtime: docker
     plan: starter
     region: oregon
-
     dockerfilePath: ./Dockerfile
-
     dockerCommand: python -m app.services.daily_checkin --once
-
-    # Once every day at 00:00 UTC
-    schedule: "0 0 * * *"
-
+    schedule: "0 * * * *"
     envVars:
-
       - fromGroup: healthbot-secrets
-
       - key: DATABASE_URL
         fromDatabase:
           name: healthbot-db
           property: connectionString
-
       - key: REDIS_URL
         fromService:
           type: keyvalue
           name: healthbot-redis
           property: connectionString
-
       - key: KAFKA_BOOTSTRAP_SERVERS
         fromService:
           type: pserv
