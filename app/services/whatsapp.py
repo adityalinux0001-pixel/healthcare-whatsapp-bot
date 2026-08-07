@@ -297,12 +297,8 @@ async def mark_as_read(message_id: str, show_typing: bool = False) -> dict:
 
     Args:
         message_id: the WhatsApp message ID to mark as read.
-        show_typing: if True, also shows the native WhatsApp "typing…"
-            indicator to the user (three animated dots) for a few seconds
-            or until the actual reply is sent, whichever comes first —
-            whichever comes first is handled entirely by WhatsApp itself,
-            no extra calls needed on our side. Purely cosmetic; failure to
-            show it is not critical and never raises.
+        show_typing: retained for signature compatibility. Note that Cloud API
+            does not support typing indicators in the read payload.
     """
     settings = get_settings()
     
@@ -311,14 +307,12 @@ async def mark_as_read(message_id: str, show_typing: bool = False) -> dict:
         "Content-Type": "application/json",
     }
     
+    # Meta Graph API v25.0 strict read-receipt payload
     payload = {
         "messaging_product": "whatsapp",
         "status": "read",
         "message_id": message_id,
     }
-
-    if show_typing:
-        payload["typing_indicator"] = {"type": "text"}
     
     try:
         url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
@@ -326,9 +320,8 @@ async def mark_as_read(message_id: str, show_typing: bool = False) -> dict:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        logger.error(f"Failed to mark message as read: {e}")
-        # Don't raise - not critical
-
+        logger.error(f"Failed to mark message as read ({message_id}): {e}")
+        return {}
 
 async def verify_token_valid() -> dict:
     """Verify that the WhatsApp token is valid."""
