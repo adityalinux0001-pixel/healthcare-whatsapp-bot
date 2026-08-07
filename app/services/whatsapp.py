@@ -293,41 +293,39 @@ async def send_template_message(to: str, template_name: str, params: list = None
 
 async def mark_as_read(message_id: str, show_typing: bool = False) -> dict:
     """
-    Mark a received message as read.
+    Mark a received message as read via Meta Graph API v25.0.
 
     Args:
-        message_id: the WhatsApp message ID to mark as read.
-        show_typing: if True, also shows the native WhatsApp "typing…"
-            indicator to the user (three animated dots) for a few seconds
-            or until the actual reply is sent, whichever comes first —
-            whichever comes first is handled entirely by WhatsApp itself,
-            no extra calls needed on our side. Purely cosmetic; failure to
-            show it is not critical and never raises.
+        message_id: the WhatsApp message ID (wamid...) to mark as read.
+        show_typing: retained for signature compatibility.
     """
+    if not message_id or not isinstance(message_id, str):
+        logger.warning(f"⚠️ Skipping mark_as_read: invalid message_id '{message_id}'")
+        return {}
+
     settings = get_settings()
-    
+
     headers = {
         "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
         "Content-Type": "application/json",
     }
-    
+
+    # ✅ FIXED: Strict Meta Graph API read-receipt payload (no invalid keys)
     payload = {
         "messaging_product": "whatsapp",
         "status": "read",
         "message_id": message_id,
     }
 
-    if show_typing:
-        payload["typing_indicator"] = {"type": "text"}
-    
     try:
         url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
-        resp = await _client().post(url, json=payload, headers=headers, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        async with _client() as client:
+            resp = await client.post(url, json=payload, headers=headers, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
     except Exception as e:
-        logger.error(f"Failed to mark message as read: {e}")
-        # Don't raise - not critical
+        logger.error(f"Failed to mark message as read ({message_id}): {e}")
+        return {}
 
 
 async def verify_token_valid() -> dict:
