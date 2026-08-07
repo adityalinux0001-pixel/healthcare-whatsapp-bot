@@ -117,7 +117,7 @@ services:
       # Broker listens on 9092
       # Controller listens on 9093
       - key: KAFKA_LISTENERS
-        value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+        value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://127.0.0.1:9093"
 
       # IMPORTANT:
       # Application clients connect to 9092.
