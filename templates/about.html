@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="page-header">
+  <div class="container">
+    <span class="eyebrow">About</span>
+    <h1>Health guidance that meets you where you already are</h1>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container policy">
+    <p style="font-size:1.05rem;">
+      {{ site.BUSINESS_NAME }} builds {{ site.PRODUCT_NAME }}, an AI-powered
+      assistant delivered entirely through WhatsApp. The goal is simple:
+      make it easy to ask a health question and get a clear, contextual
+      answer without downloading another app or waiting for an appointment
+      slot.
+    </p>
+    <p>
+      The assistant handles everyday questions by text messages — for people who want ongoing structure — offers a
+      {{ site.PLAN_DURATION_DAYS }}-day guided plan with a personalized
+      daily check-in.
+    </p>
+    <p>
+      {{ site.PRODUCT_NAME }} is an informational and support tool. It does
+      not replace professional medical advice, diagnosis, or treatment —
+      see our <a href="/terms-and-conditions">Terms &amp; Conditions</a>
+      for details.
+    </p>
+    <p class="muted">
+      Business address: {{ site.BUSINESS_ADDRESS }}<br>
+      Contact: {{ site.SUPPORT_EMAIL }}
+    </p>
+  </div>
+</section>
+
+{% endblock %}

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="page-header">
+  <div class="container">
+    <span class="eyebrow">Legal</span>
+    <h1>Cancellation &amp; Refund Policy</h1>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container policy">
+    <p class="policy-updated">Effective date: {{ site.EFFECTIVE_DATE }}</p>
+
+    <h2>1. Before Activation</h2>
+    <p>If you complete payment but the {{ site.PLAN_DURATION_DAYS }}-day plan has not yet been activated (i.e. onboarding has not been completed and Day 1 has not been sent), you may request a full refund by contacting {{ site.SUPPORT_EMAIL }}.</p>
+
+    <h2>2. After Activation</h2>
+    <p>Once your plan is activated and Day 1 has been delivered, the payment is generally non-refundable, since access to the personalized {{ site.PLAN_DURATION_DAYS }}-day plan and daily check-ins has already begun. Refund requests after activation are reviewed on a case-by-case basis.</p>
+
+    <h2>3. Non-Refundable Situations</h2>
+    <ul>
+      <li>Change of mind after the plan has been activated and check-ins have started.</li>
+      <li>Partial use of the {{ site.PLAN_DURATION_DAYS }}-day period.</li>
+      <li>Failure to engage with check-ins once activated.</li>
+    </ul>
+
+    <h2>4. Failed or Duplicate Payments</h2>
+    <p>If a payment fails but funds are deducted, or if you are charged more than once for the same plan, contact {{ site.SUPPORT_EMAIL }} with your payment reference. Verified failed or duplicate payments are refunded in full.</p>
+
+    <h2>5. Refund Processing Time</h2>
+    <p>Approved refunds are processed back to the original payment method via Razorpay within {{ site.REFUND_PROCESSING_DAYS }} of approval. Actual credit timing may depend on your bank or payment provider.</p>
+
+    <h2>6. How to Request a Refund</h2>
+    <p>Email {{ site.SUPPORT_EMAIL }} with your registered WhatsApp number and payment reference/date. We'll confirm eligibility and next steps.</p>
+  </div>
+</section>
+
+{% endblock %}

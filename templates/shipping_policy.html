@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="page-header">
+  <div class="container">
+    <span class="eyebrow">Legal</span>
+    <h1>Shipping Policy</h1>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container policy">
+    <p class="policy-updated">Effective date: {{ site.EFFECTIVE_DATE }}</p>
+
+    <h2>Digital Service — No Physical Shipping</h2>
+    <p>{{ site.PRODUCT_NAME }} is a fully digital service delivered over WhatsApp. No physical products are shipped, and no shipping charges apply.</p>
+
+    <h2>Activation &amp; Delivery</h2>
+    <p>Access to the {{ site.PLAN_NAME }} is activated automatically once payment is confirmed by Razorpay. A short onboarding conversation begins immediately in WhatsApp, followed by Day 1 of your plan, typically within minutes of successful payment.</p>
+
+    <h2>Questions</h2>
+    <p>If you've completed payment but haven't received a response within a reasonable time, contact {{ site.SUPPORT_EMAIL }}.</p>
+  </div>
+</section>
+
+{% endblock %}

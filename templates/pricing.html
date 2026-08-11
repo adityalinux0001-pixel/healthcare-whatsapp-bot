@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="page-header">
+  <div class="container">
+    <span class="eyebrow">Pricing</span>
+    <h1>One plan. One clear price.</h1>
+    <p>A single {{ site.PLAN_DURATION_DAYS }}-day plan — not a recurring subscription.</p>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container">
+    <div class="price-card">
+      <h3>{{ site.PLAN_NAME }}</h3>
+      <div class="price-amount">{{ site.plan_price_display }}</div>
+      <div class="price-duration">One-time payment · valid for {{ site.PLAN_DURATION_DAYS }} days</div>
+
+      <ul class="price-features">
+        <li>Unlimited AI-powered WhatsApp Q&amp;A during the plan period</li>
+        <li>Text-based support</li>
+        <li>Personalized intake before Day 1</li>
+        <li>One check-in delivered per day, at your chosen time</li>
+        <li>Follow-up question after each check-in to keep you on track</li>
+        <li>Secure payment via Razorpay</li>
+      </ul>
+
+      <a href="{{ site.whatsapp_chat_url }}" class="btn btn-primary" style="width:100%;justify-content:center;">Subscribe Now</a>
+
+      <p class="price-note">
+        Payments are securely processed through Razorpay. This is a
+        one-time {{ site.PLAN_DURATION_DAYS }}-day plan, not an auto-renewing
+        subscription — it will not renew or charge you again automatically.
+        You'll message us on WhatsApp to activate; the payment link is sent
+        to you directly in the chat.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container text-center">
+    <p class="muted">Questions about billing or refunds? See our <a href="/refund-policy">Cancellation &amp; Refund Policy</a> or <a href="/contact">contact us</a>.</p>
+  </div>
+</section>
+
+{% endblock %}

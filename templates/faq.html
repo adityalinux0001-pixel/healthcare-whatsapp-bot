@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="page-header">
+  <div class="container">
+    <span class="eyebrow">FAQ</span>
+    <h1>Frequently asked questions</h1>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container policy">
+
+    <details class="faq-item" open>
+      <summary>What is {{ site.PRODUCT_NAME }}?</summary>
+      <p>An AI-powered assistant that answers health questions over WhatsApp, using text messages and offers an optional {{ site.PLAN_DURATION_DAYS }}-day plan with daily check-ins.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>How does the assistant work?</summary>
+      <p>You message us on WhatsApp. The assistant reads your message (and recent conversation context) and replies directly in the same chat.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>How do I purchase the plan?</summary>
+      <p>Message us on WhatsApp and ask to start the {{ site.PLAN_DURATION_DAYS }}-day plan. You'll receive a secure Razorpay payment link in the chat.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>How long is the plan valid?</summary>
+      <p>{{ site.PLAN_DURATION_DAYS }} days from activation. It's a one-time plan, not a recurring subscription.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>How is payment processed?</summary>
+      <p>Through Razorpay, using a payment link sent directly in your WhatsApp conversation.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>Is payment secure?</summary>
+      <p>Yes — payments are handled entirely by Razorpay's secure checkout.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>Do you store my card information?</summary>
+      <p>No. Card and payment details are handled and stored by Razorpay, not by us.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>How can I request a refund?</summary>
+      <p>Email {{ site.SUPPORT_EMAIL }} — see our <a href="/refund-policy">Cancellation &amp; Refund Policy</a> for eligibility and timelines.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>How can I contact support?</summary>
+      <p>Email {{ site.SUPPORT_EMAIL }}, use the <a href="/contact">contact form</a>, or message us on WhatsApp.</p>
+    </details>
+
+    <details class="faq-item">
+      <summary>Does the service require WhatsApp?</summary>
+      <p>Yes — the entire experience runs inside WhatsApp; there's no separate app.</p>
+    </details>
+
+  </div>
+</section>
+
+{% endblock %}

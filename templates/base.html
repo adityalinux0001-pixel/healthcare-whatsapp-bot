@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ page_title or site.PRODUCT_NAME }}</title>
+<meta name="description" content="{% block meta_description %}{{ site.PRODUCT_NAME }} is an AI-powered health assistant delivered over WhatsApp — ask health questions by text, voice, or photo, and get a personalized {{ site.PLAN_DURATION_DAYS }}-day daily check-in plan.{% endblock %}">
+
+<meta property="og:title" content="{{ page_title or site.PRODUCT_NAME }}">
+<meta property="og:description" content="{{ site.TAGLINE }}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="{{ request.url }}">
+
+<link rel="icon" href="/static/favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+{% block extra_head %}{% endblock %}
+</head>
+<body>
+{% include "partials/nav.html" %}
+
+<main>
+{% block content %}{% endblock %}
+</main>
+
+{% include "partials/footer.html" %}
+
+<script src="/static/js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="hero">
+  <div class="container" style="display:contents;">
+    <div>
+      <span class="eyebrow">AI Health Assistant on WhatsApp</span>
+      <h1>AI-powered health support, right on WhatsApp.</h1>
+      <p style="font-size:1.1rem;">
+        Ask a health question by text, and get a
+        clear, context-aware answer in seconds. Go premium for a
+        personalized {{ site.PLAN_DURATION_DAYS }}-day plan with daily
+        check-ins — no new app to install, just WhatsApp.
+      </p>
+      <div class="hero-ctas">
+        <a href="/pricing" class="btn btn-primary">Get Started</a>
+        <a href="/how-it-works" class="btn btn-secondary">See How It Works</a>
+      </div>
+      <p class="hero-note">Works entirely inside WhatsApp · Payments secured by Razorpay</p>
+    </div>
+
+    <div class="chat-mock" aria-hidden="true">
+      <div class="chat-mock-header">
+        <div class="chat-mock-avatar">AI</div>
+        <div>
+          <div class="chat-mock-title">{{ site.PRODUCT_NAME }}</div>
+          <div class="chat-mock-status">Active now</div>
+        </div>
+      </div>
+
+      <div class="bubble in">
+        I've had a mild headache since yesterday and I'm not sleeping well. Should I be worried?
+        <span class="tick">9:14 AM</span>
+      </div>
+      <div class="bubble out">
+        Thanks for sharing that — a couple of quick questions so I can guide you properly: any fever, or is this the first time it's lasted more than a day?
+        <span class="tick">9:14 AM · Delivered</span>
+      </div>
+      <div class="bubble in">
+        No fever, just tired and a bit stressed at work.
+        <span class="tick">9:15 AM</span>
+      </div>
+      <div class="bubble out">
+        That sounds more like tension and poor sleep than anything urgent. Here's what usually helps tonight, and I'll check in with you tomorrow morning 👇
+        <span class="tick">9:15 AM · Delivered</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container">
+    <div class="section-head">
+      <h2>Everything happens where your customers already are</h2>
+      <p>No app downloads, no new logins — just a WhatsApp conversation that understands context and remembers the last few messages.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-icon">💬</div>
+        <h3>Text</h3>
+        <p>Type your question and get quick, intelligent responses from the assistant.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🧠</div>
+        <h3>Context-aware replies</h3>
+        <p>Every answer accounts for the last few messages in the conversation, not just the one you just sent.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">📅</div>
+        <h3>{{ site.PLAN_DURATION_DAYS }}-day daily check-ins</h3>
+        <p>Premium users get a personalized plan delivered one day at a time, at the hour they choose.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <div class="cta-banner">
+      <h2>Ready to try it?</h2>
+      <p>Start a conversation on WhatsApp, or see what's included in the {{ site.PLAN_DURATION_DAYS }}-day plan first.</p>
+      <div class="hero-ctas" style="justify-content:center;">
+        <a href="{{ site.whatsapp_chat_url }}" class="btn btn-primary">Message Us on WhatsApp</a>
+        <a href="/pricing" class="btn btn-secondary" style="color:#fff;border-color:rgba(255,255,255,0.4);">View Pricing</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+{% endblock %}

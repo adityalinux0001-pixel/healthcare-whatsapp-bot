@@ -1,0 +1,35 @@
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-col">
+        <h4>{{ site.PRODUCT_NAME }}</h4>
+        <p>{{ site.TAGLINE }}.</p>
+        <p>{{ site.SUPPORT_EMAIL }}</p>
+      </div>
+      <div class="footer-col">
+        <h4>Product</h4>
+        <a href="/">Home</a>
+        <a href="/features">Features</a>
+        <a href="/how-it-works">How It Works</a>
+        <a href="/pricing">Pricing</a>
+        <a href="/faq">FAQ</a>
+      </div>
+      <div class="footer-col">
+        <h4>Company</h4>
+        <a href="/about">About</a>
+        <a href="/contact">Contact</a>
+      </div>
+      <div class="footer-col">
+        <h4>Legal</h4>
+        <a href="/privacy-policy">Privacy Policy</a>
+        <a href="/terms-and-conditions">Terms &amp; Conditions</a>
+        <a href="/refund-policy">Cancellation &amp; Refund</a>
+        <a href="/shipping-policy">Shipping Policy</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© {{ site.EFFECTIVE_DATE[:4] if site.EFFECTIVE_DATE and site.EFFECTIVE_DATE[:4].isdigit() else "2026" }} {{ site.BUSINESS_NAME }}. All rights reserved.</span>
+      <span>Payments secured by Razorpay</span>
+    </div>
+  </div>
+</footer>

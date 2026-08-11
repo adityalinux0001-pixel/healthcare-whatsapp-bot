@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="page-header">
+  <div class="container">
+    <span class="eyebrow">How It Works</span>
+    <h1>From first message to daily check-in</h1>
+    <p>A straightforward flow — no dashboards to configure.</p>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container">
+    <div class="steps" style="max-width:720px;margin:0 auto;">
+      <div class="step">
+        <div class="step-index">1</div>
+        <div>
+          <h3>Message us on WhatsApp</h3>
+          <p>Send a text message describing your question — no account or app download required.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-index">2</div>
+        <div>
+          <h3>The assistant understands your question</h3>
+          <p>Your text message is analyzed along with recent conversation history to understand the context and provide a relevant response.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-index">3</div>
+        <div>
+          <h3>You get a clear, relevant answer</h3>
+          <p>Replies come back directly in WhatsApp, usually within seconds.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-index">4</div>
+        <div>
+          <h3>Choose to go premium (optional)</h3>
+          <p>Pay {{ site.plan_price_display }} for the {{ site.PLAN_DURATION_DAYS }}-day plan via a secure Razorpay payment link — sent to you right in the chat.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-index">5</div>
+        <div>
+          <h3>A short intake, once</h3>
+          <p>A handful of quick questions (goals, preferences, any conditions to be mindful of, and your preferred check-in time) so Day 1 can be personalized.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-index">6</div>
+        <div>
+          <h3>Daily check-ins for {{ site.PLAN_DURATION_DAYS }} days</h3>
+          <p>One plan day is delivered per day, at your chosen time, with a quick follow-up question to keep things on track.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container text-center">
+    <a href="{{ site.whatsapp_chat_url }}" class="btn btn-primary">Start on WhatsApp</a>
+  </div>
+</section>
+
+{% endblock %}

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="page-header">
+  <div class="container">
+    <span class="eyebrow">Legal</span>
+    <h1>Privacy Policy</h1>
+  </div>
+</section>
+
+<section class="tight">
+  <div class="container policy">
+    <p class="policy-updated">Effective date: {{ site.EFFECTIVE_DATE }}</p>
+
+    <p>This Privacy Policy explains how {{ site.BUSINESS_NAME }} ("we", "us", "our") collects, uses, and protects information when you use {{ site.PRODUCT_NAME }} (the "Service") over WhatsApp.</p>
+
+    <h2>1. Information We Collect</h2>
+    <ul>
+      <li><strong>Contact information</strong> — your WhatsApp number, and name or email if you provide them (e.g. via the contact form).</li>
+      <li><strong>Conversation content</strong> — the messages, voice notes, and photos you send us, and our replies, so we can provide context-aware responses.</li>
+      <li><strong>Account/profile information</strong> — details you share during premium onboarding (such as goals, preferences, and check-in timing) used to personalize your plan.</li>
+      <li><strong>Payment-related information</strong> — limited details about a transaction (amount, status, plan) needed to activate your plan. We do not collect or store your card, UPI, or bank details ourselves — see Section 4.</li>
+    </ul>
+
+    <h2>2. How We Use Information</h2>
+    <ul>
+      <li>To respond to your questions and provide the Service.</li>
+      <li>To personalize your {{ site.PLAN_DURATION_DAYS }}-day plan and daily check-ins.</li>
+      <li>To process payments and activate premium access.</li>
+      <li>To maintain conversation history so replies stay relevant to recent context.</li>
+      <li>To respond to support requests submitted via the contact form or WhatsApp.</li>
+    </ul>
+
+    <h2>3. Data Security</h2>
+    <p>We store conversation and account data in a managed, access-controlled database. Reasonable technical and organizational measures are used to protect it, though no method of storage or transmission is 100% secure.</p>
+
+    <h2>4. Third-Party Services</h2>
+    <ul>
+      <li><strong>Razorpay</strong> processes all payments. Card, UPI, and bank details are handled directly by Razorpay under its own privacy and security policies — we do not receive or store this data.</li>
+      <li><strong>WhatsApp / Meta</strong> is the messaging platform through which the Service is delivered, subject to WhatsApp's own terms and privacy policy.</li>
+      <li><strong>AI/LLM processing</strong> — your messages (including transcribed voice notes and image descriptions) are processed by our AI/LLM provider(s) to generate responses.</li>
+    </ul>
+
+    <h2>5. Data Retention</h2>
+    <p>We retain conversation and account data for as long as needed to provide the Service and for a reasonable period afterward for support and record-keeping purposes, unless you request earlier deletion.</p>
+
+    <h2>6. Your Rights</h2>
+    <p>You may request access to, correction of, or deletion of your personal data by contacting us at {{ site.SUPPORT_EMAIL }}. We will respond within a reasonable timeframe.</p>
+
+    <h2>7. Changes to This Policy</h2>
+    <p>We may update this Privacy Policy from time to time. Material changes will be reflected by updating the effective date above.</p>
+
+    <h2>8. Contact Us</h2>
+    <p>{{ site.BUSINESS_NAME }}<br>{{ site.BUSINESS_ADDRESS }}<br>{{ site.SUPPORT_EMAIL }}</p>
+  </div>
+</section>
+
+{% endblock %}

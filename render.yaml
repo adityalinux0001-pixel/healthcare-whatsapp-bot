@@ -17,19 +17,11 @@ envVarGroups:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-      - key: PHONEPE_CLIENT_ID
+      - key: RAZORPAY_KEY_ID
         sync: false
-      - key: PHONEPE_CLIENT_SECRET
+      - key: RAZORPAY_KEY_SECRET
         sync: false
-      - key: PHONEPE_CLIENT_VERSION
-        sync: false
-      - key: PHONEPE_ENV
-        value: production
-      - key: PHONEPE_WEBHOOK_USERNAME
-        sync: false
-      - key: PHONEPE_WEBHOOK_PASSWORD
-        sync: false
-      - key: PHONEPE_REDIRECT_URL
+      - key: RAZORPAY_WEBHOOK_SECRET
         sync: false
       - key: LOG_LEVEL
         value: INFO
