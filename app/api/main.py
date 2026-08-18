@@ -611,6 +611,62 @@ async def _maybe_send_greeting(phone_number: str) -> bool:
         return False
 
 
+async def _maybe_send_unpaid_plan_reminder(
+    phone_number: str, required_language: str | None = None
+) -> bool:
+    """Send a soft 21-day plan reminder WITH a payment link to users who
+    are not premium. Reuses the existing unpaid link if one already
+    exists (no duplicate Razorpay link/row created); otherwise creates a
+    fresh one.
+    """
+    try:
+        if await asyncio.to_thread(memory.is_premium_active, phone_number):
+            return False
+
+        # Reuse existing unpaid link instead of creating a new one every time.
+        latest_link = await asyncio.to_thread(
+            memory.get_latest_payment_link_for_user, phone_number
+        )
+        if latest_link and latest_link.get("status") != "paid" and latest_link.get("short_url"):
+            short_url = latest_link["short_url"]
+        else:
+            link = await create_payment_link(
+                phone_number=phone_number,
+                amount_rupees=settings.PREMIUM_PLAN_AMOUNT_RUPEES,
+                description=f"AI Health Assistant — {settings.PREMIUM_PLAN_DAYS}-day Premium",
+            )
+            await asyncio.to_thread(
+                memory.save_payment_link,
+                link["id"],
+                phone_number,
+                settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
+                link.get("short_url"),
+            )
+            short_url = link["short_url"]
+
+        reminder_text = (
+            "If you want more structure, I also offer a "
+            f"{settings.PREMIUM_PLAN_DAYS}-day guided health plan with "
+            "daily check-ins and personalized follow-up 👇\n\n"
+            f"{short_url}"
+        )
+        reminder_text = await translate_premium_offer_text(
+            reminder_text, required_language or "English"
+        )
+        await send_text_message(phone_number, reminder_text)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", reminder_text, message_type="text"
+        )
+        logger.info(f"📣 Sent unpaid plan reminder + link to {phone_number}")
+        return True
+    except Exception as e:
+        logger.error(
+            f"❌ Failed to send unpaid plan reminder for {phone_number}: {e}",
+            exc_info=True,
+        )
+        return False
+
+
 async def maybe_send_followup(
     phone_number: str,
     customer_summary: str,
@@ -1121,6 +1177,13 @@ Type /stats to see your conversation statistics.
         except Exception as e:
             logger.error(f"❌ Failed to send reply: {e}", exc_info=True)
 
+        if not await asyncio.to_thread(memory.is_premium_active, sender):
+            background_tasks.append(asyncio.create_task(
+                _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
+
+
+            ))
+
         # Update summary in background
         customer_data = await asyncio.to_thread(memory.get_customer, sender)
         background_tasks.append(asyncio.create_task(
@@ -1214,6 +1277,11 @@ Type /stats to see your conversation statistics.
             # Send response
             await send_text_message(sender, reply)
             logger.info(f"🤖 → [{sender}]: {reply[:100]}...")
+
+            if not await asyncio.to_thread(memory.is_premium_active, sender):
+                background_tasks.append(asyncio.create_task(
+                    _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
+                ))
             
             # Update summary in background
             customer_data = await asyncio.to_thread(memory.get_customer, sender)
@@ -1282,6 +1350,11 @@ Type /stats to see your conversation statistics.
             
             await send_text_message(sender, reply)
             logger.info(f"🤖 → [{sender}]: {reply[:100]}...")
+
+            if not await asyncio.to_thread(memory.is_premium_active, sender):
+                background_tasks.append(asyncio.create_task(
+                    _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
+                ))
             
             # Update summary in background
             customer_data = await asyncio.to_thread(memory.get_customer, sender)
