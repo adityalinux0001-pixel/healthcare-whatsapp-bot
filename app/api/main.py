@@ -39,6 +39,7 @@ from app.services.llm import (
     detect_reply_language,
     translate_premium_offer_text,
     classify_premium_intent,
+    classify_payment_status_intent,
     is_gemini_busy,
     GeminiUnavailableError,
 )
@@ -371,7 +372,7 @@ _DEFAULT_PREMIUM_OFFER_COPY = {
 
 async def _maybe_send_premium_offer(
     phone_number: str, force_resend: bool = False, required_language: str | None = None
-) -> None:
+) -> bool:
     """
     Runs on EVERY incoming message and decides whether to send a Razorpay
     payment link for the 21-day premium plan. Three cases:
@@ -412,6 +413,12 @@ async def _maybe_send_premium_offer(
 
     Failure here (Razorpay API down, etc.) is logged and swallowed — it
     must never block or break the user's actual conversation.
+
+    Returns True only if a message (expiry notice or offer/resend) was
+    actually sent this call — False for case 1, a throttled case-3 skip,
+    or any exception. Callers use this to avoid ALSO firing
+    _maybe_send_unpaid_plan_reminder in the same turn, which would put
+    two separate payment-link messages back to back for one reply.
     """
     try:
         subscription = await asyncio.to_thread(memory.get_subscription, phone_number)
@@ -424,7 +431,7 @@ async def _maybe_send_premium_offer(
             if datetime.utcnow() < expires_at:
                 # Case 1: still active — say nothing.
                 logger.info(f"💎 {phone_number} already has active premium — skipping upsell.")
-                return
+                return False
 
             if not subscription.get("expiry_notified"):
                 # Case 2: just expired, one-time notice not sent yet.
@@ -457,7 +464,7 @@ async def _maybe_send_premium_offer(
                     memory.save_message, phone_number, "assistant", expiry_text, message_type="text"
                 )
                 logger.info(f"⌛ Sent expiry notice to {phone_number} | link_id={link['id']}")
-                return
+                return True
 
         # Case 3: never subscribed, or already notified of this expiry —
         # fall through to the normal throttled recurring reminder below.
@@ -474,7 +481,7 @@ async def _maybe_send_premium_offer(
                         f"already sent {seconds_since:.0f}s ago (throttle: "
                         f"{settings.PREMIUM_REOFFER_MIN_GAP_SECONDS}s)."
                     )
-                    return
+                    return False
 
         resent_existing_link = False
         if latest_link and latest_link.get("status") != "paid" and force_resend:
@@ -515,7 +522,7 @@ async def _maybe_send_premium_offer(
             )
     except Exception as e:
         logger.error(f"❌ Failed to create/send premium offer for {phone_number}: {e}", exc_info=True)
-        return
+        return False
 
     try:
         if not resent_existing_link:
@@ -550,8 +557,10 @@ async def _maybe_send_premium_offer(
             memory.save_message, phone_number, "assistant", offer_text, message_type="text"
         )
         logger.info(f"💳 Sent premium offer to {phone_number} | link_id={link['id']}")
+        return True
     except Exception as e:
         logger.error(f"❌ Failed to send/save premium offer message for {phone_number}: {e}", exc_info=True)
+        return False
 
 
 
@@ -665,6 +674,189 @@ async def _maybe_send_unpaid_plan_reminder(
             exc_info=True,
         )
         return False
+
+
+async def _send_payment_status_message(
+    phone_number: str, required_language: str | None = None
+) -> None:
+    """
+    Sent when classify_payment_status_intent() detects the user is
+    asking about THEIR OWN payment/subscription status (e.g. "is my
+    payment done"), instead of the general premium-offer pitch. Looks
+    up the real subscription row and replies with a plain done/not-done
+    status — no payment link on the "done" branch (they don't need one),
+    a payment link on the "not done" branch so they can act right away.
+    """
+    try:
+        subscription = await asyncio.to_thread(memory.get_subscription, phone_number)
+        is_active = await asyncio.to_thread(memory.is_premium_active, phone_number)
+
+        if is_active and subscription:
+            expires_at = subscription["expires_at"]
+            if expires_at.tzinfo is not None:
+                expires_at = expires_at.replace(tzinfo=None)
+            status_text = (
+                f"✅ Your payment is done — your {settings.PREMIUM_PLAN_DAYS}-day "
+                f"Premium plan is active until {expires_at.strftime('%d %b %Y')}."
+            )
+        else:
+            # Either no subscription row at all, or one that's expired —
+            # both read as "not done" from the user's point of view.
+            latest_link = await asyncio.to_thread(
+                memory.get_latest_payment_link_for_user, phone_number
+            )
+            if latest_link and latest_link.get("status") != "paid" and latest_link.get("short_url"):
+                short_url = latest_link["short_url"]
+            else:
+                link = await create_payment_link(
+                    phone_number=phone_number,
+                    amount_rupees=settings.PREMIUM_PLAN_AMOUNT_RUPEES,
+                    description=f"AI Health Assistant — {settings.PREMIUM_PLAN_DAYS}-day Premium",
+                )
+                await asyncio.to_thread(
+                    memory.save_payment_link,
+                    link["id"], phone_number,
+                    settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
+                    link.get("short_url"),
+                )
+                short_url = link["short_url"]
+
+            status_text = (
+                f"❌ Your payment is not done yet — you don't have an active "
+                f"Premium plan right now.\n\nYou can complete it here:\n{short_url}"
+            )
+
+        status_text = await translate_premium_offer_text(
+            status_text, required_language or "English"
+        )
+        await send_text_message(phone_number, status_text)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", status_text, message_type="text"
+        )
+        logger.info(f"💳 Sent payment status ({'done' if is_active else 'not done'}) to {phone_number}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send payment status for {phone_number}: {e}", exc_info=True)
+
+
+async def _send_free_limit_message(
+    phone_number: str, is_first_hit: bool, required_language: str | None = None
+) -> None:
+    """
+    Sent INSTEAD OF an actual answer once a non-premium user has used up
+    settings.FREE_QUESTION_LIMIT free questions (see the gate in
+    _handle_incoming, right before generate_context_aware_response is
+    called). No LLM call is spent answering the question itself.
+
+    is_first_hit=True is the very first message that crosses the limit
+    (question #FREE_QUESTION_LIMIT + 1) — gets the "you've used up your
+    free questions" framing. Every question after that (is_first_hit=
+    False) gets a differently-worded repeat so it doesn't read like a
+    stuck bot repeating itself, while still always including the app
+    features + payment link.
+
+    Reuses an existing unpaid payment link when one is already on file,
+    same pattern as _maybe_send_unpaid_plan_reminder, instead of minting
+    a fresh Razorpay link on every single blocked question.
+    """
+    try:
+        latest_link = await asyncio.to_thread(
+            memory.get_latest_payment_link_for_user, phone_number
+        )
+        if latest_link and latest_link.get("status") != "paid" and latest_link.get("short_url"):
+            short_url = latest_link["short_url"]
+        else:
+            link = await create_payment_link(
+                phone_number=phone_number,
+                amount_rupees=settings.PREMIUM_PLAN_AMOUNT_RUPEES,
+                description=f"AI Health Assistant — {settings.PREMIUM_PLAN_DAYS}-day Premium",
+            )
+            await asyncio.to_thread(
+                memory.save_payment_link,
+                link["id"], phone_number,
+                settings.PREMIUM_PLAN_AMOUNT_RUPEES * 100,
+                link.get("short_url"),
+            )
+            short_url = link["short_url"]
+
+        category = await asyncio.to_thread(memory.get_user_category, phone_number)
+        copy = _PREMIUM_OFFER_COPY.get(category, _DEFAULT_PREMIUM_OFFER_COPY)
+
+        if is_first_hit:
+            text = (
+                f"You've used up your {settings.FREE_QUESTION_LIMIT} free questions "
+                f"for now. 🙌\n\n"
+                f"To keep getting answers, grab our {settings.PREMIUM_PLAN_DAYS}-Day "
+                f"{copy['plan_name']} for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES} — you get:\n"
+                f"1. A daily action plan for {settings.PREMIUM_PLAN_DAYS} days — {copy['daily_item']}\n"
+                f"2. Priority, more detailed answers whenever you're stuck or plateauing\n"
+                f"3. {copy['adapt_line']}\n\n"
+                f"Pay here to keep going:\n{short_url}"
+            )
+        else:
+            text = (
+                f"Still here whenever you're ready 🙂\n\n"
+                f"Premium unlocks unlimited questions, a personalized "
+                f"{settings.PREMIUM_PLAN_DAYS}-day plan with daily check-ins, and "
+                f"priority answers — all for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES}.\n\n"
+                f"Grab it here:\n{short_url}"
+            )
+
+        text = await translate_premium_offer_text(text, required_language or "English")
+        await send_text_message(phone_number, text)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", text, message_type="text"
+        )
+        logger.info(
+            f"🚫 Free question limit reached for {phone_number} "
+            f"(first_hit={is_first_hit}) — sent app features + link instead of an answer."
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to send free-limit message for {phone_number}: {e}", exc_info=True)
+
+
+async def _flush_pending_checkin_day(phone_number: str, plan_day: dict) -> None:
+    """
+    Push a premium plan day's REAL content as free-form text, right after
+    this user's WhatsApp session window just reopened (they sent
+    something — any message, any type). Counterpart to the re-engagement
+    template sent by daily_checkin.py when the window was closed at the
+    scheduled check-in time: that template only nudges the user; this is
+    what actually delivers the day's message + follow-up question,
+    exactly like _send_checkin_for_user does when the window was already
+    open. Called from _handle_incoming before that message is otherwise
+    processed, so the plan never falls further behind schedule just
+    because a user didn't message for a day or two.
+    """
+    day_number = plan_day["day_number"]
+    header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
+    message = header + plan_day["message_text"]
+    followup_question = plan_day.get("followup_question")
+
+    try:
+        await send_text_message(phone_number, message)
+        await asyncio.to_thread(memory.mark_plan_day_sent, phone_number, day_number)
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", message, message_type="text"
+        )
+        logger.info(
+            f"✅ Flushed held day {day_number} content for {phone_number} "
+            f"now that their session window is open."
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to flush pending check-in day for {phone_number}: {e}", exc_info=True)
+        return
+
+    if followup_question:
+        try:
+            await send_text_message(phone_number, followup_question)
+            await asyncio.to_thread(
+                memory.save_message, phone_number, "assistant", followup_question, message_type="text"
+            )
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to send follow-up question while flushing day {day_number} "
+                f"for {phone_number}: {e}", exc_info=True,
+            )
 
 
 async def maybe_send_followup(
@@ -789,7 +981,23 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 
             if value.statuses:
                 for s in value.statuses:
-                    logger.info(f"📊 Status: {s.status} | to={s.recipient_id}")
+                    if s.errors:
+                        error_detail = "; ".join(
+                            f"code={e.code} title={e.title!r} message={e.message!r}"
+                            for e in s.errors
+                        )
+                        logger.info(
+                            f"📊 Status: {s.status} | to={s.recipient_id} | errors: {error_detail}"
+                        )
+                        if any(e.code == 131047 for e in s.errors):
+                            logger.warning(
+                                f"⏰ Message to {s.recipient_id} failed with code 131047 — "
+                                f"more than 24h since their last reply. This is the WhatsApp "
+                                f"session-window issue (see daily_checkin.py's re-engagement "
+                                f"template handling)."
+                            )
+                    else:
+                        logger.info(f"📊 Status: {s.status} | to={s.recipient_id}")
                 continue
 
             if not value.messages:
@@ -1008,6 +1216,19 @@ async def _handle_incoming(raw_msg: dict) -> None:
 
     logger.info(f"📱 From={sender} | type={msg.type} | id={msg.id}")
 
+    # This inbound message (any type) just reopened this user's 24h
+    # WhatsApp session window. If a premium daily check-in was held back
+    # earlier because the window was closed (see daily_checkin.py — it
+    # sends a re-engagement template instead of silently-undelivered free
+    # text in that case), push the real content now, before anything else.
+    try:
+        if await asyncio.to_thread(memory.is_premium_active, sender):
+            pending_day = await asyncio.to_thread(memory.get_pending_template_nudge_day, sender)
+            if pending_day:
+                await _flush_pending_checkin_day(sender, pending_day)
+    except Exception as e:
+        logger.error(f"❌ Failed to check/flush pending check-in for {sender}: {e}", exc_info=True)
+
     background_tasks: list[asyncio.Task[None]] = []
 
 
@@ -1037,6 +1258,12 @@ async def _handle_incoming(raw_msg: dict) -> None:
         except Exception as e:
             logger.error(f"❌ Onboarding reply handling failed for {sender}: {e}", exc_info=True)
 
+        # Tracks whether a payment-link message already went out earlier
+        # in THIS turn (e.g. the premium-offer branch below), so we can
+        # skip _maybe_send_unpaid_plan_reminder later and never send two
+        # separate payment-link messages for one reply.
+        premium_link_already_sent_this_turn = False
+
         recent_context_for_intent = await asyncio.to_thread(
             memory.get_conversation_context, sender, limit=5
         )
@@ -1044,9 +1271,27 @@ async def _handle_incoming(raw_msg: dict) -> None:
             user_text, recent_context=recent_context_for_intent
         )
         if premium_intent["premium_related"]:
+            # Narrow further: is this specifically "is my payment done?"
+            # rather than general interest/pricing/an explicit buy
+            # request? Those two need completely different replies (a
+            # real status lookup vs. the sales pitch), so this only runs
+            # once we already know the message is premium-related at all.
+            payment_status_intent = await classify_payment_status_intent(
+                user_text, recent_context=recent_context_for_intent
+            )
+            if payment_status_intent["payment_status_query"]:
+                await asyncio.to_thread(
+                    memory.save_message, sender, "user", user_text, message_type="text"
+                )
+                status_required_language = await detect_reply_language(user_text)
+                await _send_payment_status_message(
+                    sender, required_language=status_required_language
+                )
+                return
+
             explicit_request = premium_intent["explicit_request"]
             offer_required_language = await detect_reply_language(user_text)
-            await _maybe_send_premium_offer(
+            premium_link_already_sent_this_turn = await _maybe_send_premium_offer(
                 sender, force_resend=explicit_request, required_language=offer_required_language
             )
             if explicit_request:
@@ -1149,6 +1394,25 @@ Type /stats to see your conversation statistics.
             await send_text_message(sender, stats_msg.strip())
             return
 
+        # Free-question gate: a non-premium user gets settings.
+        # FREE_QUESTION_LIMIT questions actually answered. Every question
+        # after that gets the payment link + app features instead of an
+        # answer — no Gemini call spent on it. Checked BEFORE calling the
+        # LLM (not after) so a blocked question never touches Gemini.
+        if not await asyncio.to_thread(memory.is_premium_active, sender):
+            free_count = await asyncio.to_thread(memory.get_free_question_count, sender)
+            if free_count >= settings.FREE_QUESTION_LIMIT:
+                await asyncio.to_thread(
+                    memory.save_message, sender, "user", user_text, message_type="text"
+                )
+                gate_required_language = await detect_reply_language(user_text)
+                await _send_free_limit_message(
+                    sender,
+                    is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
+                    required_language=gate_required_language,
+                )
+                return
+
         # Generate context-aware response
         try:
             reply, required_language = await generate_context_aware_response(sender, user_text, is_audio=False)
@@ -1178,11 +1442,19 @@ Type /stats to see your conversation statistics.
             logger.error(f"❌ Failed to send reply: {e}", exc_info=True)
 
         if not await asyncio.to_thread(memory.is_premium_active, sender):
-            background_tasks.append(asyncio.create_task(
-                _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
-
-
-            ))
+            # This question just got a real answer — count it against the
+            # free-question quota (see the gate above generate_context_
+            # aware_response). Only reached when generate_context_aware_
+            # response actually succeeded, so a Gemini failure never
+            # burns a free question.
+            await asyncio.to_thread(memory.increment_free_question_count, sender)
+            if not premium_link_already_sent_this_turn:
+                # Avoid sending a SECOND payment-link message in the same
+                # turn — the premium_related branch above may have already
+                # sent one (offer or expiry notice).
+                background_tasks.append(asyncio.create_task(
+                    _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
+                ))
 
         # Update summary in background
         customer_data = await asyncio.to_thread(memory.get_customer, sender)
@@ -1247,6 +1519,26 @@ Type /stats to see your conversation statistics.
             
             logger.info(f"📝 Transcription: {transcription[:100]}... | detected_language={whisper_language}")
 
+            # Free-question gate — same rule as the text handler: a
+            # non-premium user gets settings.FREE_QUESTION_LIMIT answered
+            # questions, voice included, before every further question
+            # gets the payment link + app features instead of an answer.
+            if not await asyncio.to_thread(memory.is_premium_active, sender):
+                free_count = await asyncio.to_thread(memory.get_free_question_count, sender)
+                if free_count >= settings.FREE_QUESTION_LIMIT:
+                    await asyncio.to_thread(
+                        memory.save_message,
+                        sender, "user", f"[Voice Message]: {transcription}",
+                        message_type="audio", audio_file_path=audio_path,
+                        audio_transcription=transcription,
+                    )
+                    gate_required_language = whisper_language or await detect_reply_language(transcription)
+                    await _send_free_limit_message(
+                        sender,
+                        is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
+                        required_language=gate_required_language,
+                    )
+                    return
 
             try:
                 reply, required_language = await generate_context_aware_response(
@@ -1279,6 +1571,7 @@ Type /stats to see your conversation statistics.
             logger.info(f"🤖 → [{sender}]: {reply[:100]}...")
 
             if not await asyncio.to_thread(memory.is_premium_active, sender):
+                await asyncio.to_thread(memory.increment_free_question_count, sender)
                 background_tasks.append(asyncio.create_task(
                     _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
                 ))
@@ -1329,6 +1622,25 @@ Type /stats to see your conversation statistics.
                 image_description = await process_image_with_vision(media_bytes, mime_type)
                 logger.info(f"Image description: {image_description[:100]}...")
 
+                # Free-question gate — same rule as text/voice: a
+                # non-premium user gets settings.FREE_QUESTION_LIMIT
+                # answered questions before every further one gets the
+                # payment link + app features instead of an answer.
+                if not await asyncio.to_thread(memory.is_premium_active, sender):
+                    free_count = await asyncio.to_thread(memory.get_free_question_count, sender)
+                    if free_count >= settings.FREE_QUESTION_LIMIT:
+                        await asyncio.to_thread(
+                            memory.save_message, sender, "user",
+                            f"[Sent an Image]: {image_description}", message_type="text",
+                        )
+                        gate_required_language = await detect_reply_language(image_description)
+                        await _send_free_limit_message(
+                            sender,
+                            is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
+                            required_language=gate_required_language,
+                        )
+                        return
+
                 # Generate context-aware response FIRST — only persist
                 # anything once we know Gemini actually answered.
                 reply, required_language = await generate_context_aware_response(sender, f"[Image]: {image_description}", is_audio=False)
@@ -1352,6 +1664,7 @@ Type /stats to see your conversation statistics.
             logger.info(f"🤖 → [{sender}]: {reply[:100]}...")
 
             if not await asyncio.to_thread(memory.is_premium_active, sender):
+                await asyncio.to_thread(memory.increment_free_question_count, sender)
                 background_tasks.append(asyncio.create_task(
                     _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
                 ))

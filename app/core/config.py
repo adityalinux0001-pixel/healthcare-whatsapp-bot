@@ -86,12 +86,31 @@ class Settings(BaseSettings):
     DAILY_CHECKIN_HOUR_UTC: int = 9
     DAILY_CHECKIN_MIN_GAP_HOURS: int = 20
 
+    # WhatsApp only allows free-form text within 24h of the user's last
+    # inbound message; outside that window a plain send_text_message call
+    # is accepted by the API ("sent") but never actually delivered to the
+    # phone. This must be the name of a Meta-approved template (with one
+    # text parameter for the day number) used to re-open the session when
+    # a premium user's check-in is due but they haven't messaged recently.
+    # Leave empty to keep the old (broken-outside-24h) behavior.
+    DAILY_CHECKIN_REENGAGEMENT_TEMPLATE: str = ""
+    # Safety margin under the real 24h limit, so a check-in queued right
+    # at the edge doesn't get sent as free text a few minutes before the
+    # window actually closes.
+    WHATSAPP_SESSION_WINDOW_HOURS: float = 23.0
+
     DEFAULT_PLAN_CATEGORY: str = "weight_loss"
     PLAN_GENERATION_MAX_OUTPUT_TOKENS: int = 14000
 
     SYMPTOM_INTAKE_MAX_QUESTIONS: int = 4
     SYMPTOM_INTAKE_SESSION_TIMEOUT_SECONDS: int = 60 * 60
     PREMIUM_REOFFER_MIN_GAP_SECONDS: int = 24 * 60 * 60
+
+    # How many health questions a non-premium user gets answered for free
+    # before every further question gets the payment link + app features
+    # instead of an actual answer. Resets to 0 whenever the user buys/
+    # renews Premium (see ConversationMemory.activate_subscription).
+    FREE_QUESTION_LIMIT: int = 5
 
     # Logging
     LOG_LEVEL: str = "INFO"

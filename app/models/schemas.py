@@ -104,12 +104,33 @@ class TestAudioFlowRequest(BaseModel):
     use_voice_response: bool = True
 
 
+class WebhookErrorData(BaseModel):
+    """Extra detail Meta sometimes attaches to a status error."""
+    details: Optional[str] = None
+
+
+class WebhookError(BaseModel):
+    """
+    One entry from a failed status's `errors` array — e.g. code 131047
+    ("Re-engagement message" — more than 24h since the customer's last
+    reply, so the free-form message was never delivered). Previously
+    WebhookStatus had no `errors` field at all, so Pydantic silently
+    dropped this on every failed-status webhook and main.py's log line
+    only ever showed the bare "failed" with no reason.
+    """
+    code: Optional[int] = None
+    title: Optional[str] = None
+    message: Optional[str] = None
+    error_data: Optional[WebhookErrorData] = None
+
+
 class WebhookStatus(BaseModel):
     """Message status from Meta."""
     id: str
     recipient_id: str
     status: str
     timestamp: str
+    errors: Optional[List[WebhookError]] = None
 
 
 class WebhookContact(BaseModel):

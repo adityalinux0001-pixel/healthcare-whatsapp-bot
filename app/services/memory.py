@@ -134,6 +134,16 @@ class ConversationMemory:
                 ADD COLUMN IF NOT EXISTS preferred_checkin_hour_utc INTEGER
             ''')
 
+            # Free-question gate: counts how many questions a non-premium
+            # user has been answered since their last reset (initial
+            # signup, or their last Premium purchase/renewal — see
+            # activate_subscription). Once this hits settings.FREE_QUESTION_LIMIT,
+            # main.py stops answering and sends the payment link instead.
+            cur.execute('''
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS free_question_count INTEGER NOT NULL DEFAULT 0
+            ''')
+
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS chat_history (
                     id BIGSERIAL PRIMARY KEY,
@@ -291,6 +301,18 @@ class ConversationMemory:
                 CREATE INDEX IF NOT EXISTS idx_premium_plans_awaiting
                 ON premium_plans(phone_number, awaiting_followup)
                 WHERE awaiting_followup = TRUE
+            ''')
+
+            # Set when a check-in was due but the user's WhatsApp 24h
+            # session window was closed, so we sent a re-engagement
+            # TEMPLATE instead of the real content (sent_at stays NULL —
+            # the day is still "unsent" as far as the content goes). The
+            # webhook handler watches for this: the user's next incoming
+            # message of ANY kind reopens the window, and that's the
+            # signal to push this day's actual message immediately.
+            cur.execute('''
+                ALTER TABLE premium_plans
+                ADD COLUMN IF NOT EXISTS template_nudge_sent_at TIMESTAMPTZ
             ''')
 
 
@@ -627,6 +649,14 @@ class ConversationMemory:
                     expiry_notified = FALSE,
                     updated_at = now()
             ''', (phone_number, plan_name, now, expires_at, payment_link_id))
+
+            # Paying resets their free-question quota, so that if/when
+            # this Premium period later expires they get a fresh
+            # settings.FREE_QUESTION_LIMIT free questions again instead of
+            # immediately being stuck at the old count.
+            cur.execute('''
+                UPDATE users SET free_question_count = 0 WHERE phone_number = %s
+            ''', (phone_number,))
             conn.commit()
         return expires_at.isoformat()
 
@@ -668,6 +698,55 @@ class ConversationMemory:
                 SET expiry_notified = TRUE, updated_at = now()
                 WHERE phone_number = %s
             ''', (phone_number,))
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # Free-question gate (non-premium users)
+    # ------------------------------------------------------------------
+
+    def get_free_question_count(self, phone_number: str) -> int:
+        """How many free questions this (non-premium) user has already
+        been answered since their last reset. Callers should treat a
+        missing user row as 0, same as a brand-new user who hasn't
+        asked anything yet."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT free_question_count FROM users WHERE phone_number = %s",
+                (phone_number,),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else 0
+
+    def increment_free_question_count(self, phone_number: str) -> int:
+        """Increment (creating the user row if needed) and return the new
+        count. Call this ONLY after a question has actually been
+        answered — main.py checks the count BEFORE calling Gemini and
+        skips this call entirely once the limit is already reached, so
+        the counter only ever reflects real answered questions."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO users (phone_number, free_question_count)
+                VALUES (%s, 1)
+                ON CONFLICT (phone_number) DO UPDATE SET
+                    free_question_count = users.free_question_count + 1
+                RETURNING free_question_count
+            ''', (phone_number,))
+            new_count = cur.fetchone()[0]
+            conn.commit()
+            return new_count
+
+    def reset_free_question_count(self, phone_number: str) -> None:
+        """Manual reset hook (activate_subscription already does this
+        automatically on purchase/renewal — this is here for support/
+        admin use, e.g. comping a user extra free questions)."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET free_question_count = 0 WHERE phone_number = %s",
+                (phone_number,),
+            )
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -804,6 +883,58 @@ class ConversationMemory:
                 SELECT * FROM premium_plans
                 WHERE phone_number = %s AND day_number = %s
             ''', (phone_number, day_number))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_last_inbound_message_at(self, phone_number: str) -> Optional[datetime]:
+        """The timestamp of this user's most recent INBOUND (role='user')
+        message — this is what WhatsApp's 24h free-form-messaging window
+        is actually based on. Deliberately NOT the same as
+        users.last_message_at, which gets bumped by our own OUTBOUND
+        (role='assistant') messages too and would make a closed window
+        look open."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT timestamp FROM chat_history
+                WHERE phone_number = %s AND role = 'user'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ''', (phone_number,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def mark_plan_day_template_nudge_sent(self, phone_number: str, day_number: int) -> None:
+        """A re-engagement template was sent for this day instead of the
+        real content, because the session window was closed. sent_at
+        stays NULL on purpose — the day's actual content still hasn't
+        gone out."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE premium_plans
+                SET template_nudge_sent_at = now()
+                WHERE phone_number = %s AND day_number = %s
+            ''', (phone_number, day_number))
+            conn.commit()
+
+    def get_pending_template_nudge_day(self, phone_number: str) -> Optional[Dict]:
+        """The plan day (if any) that's waiting to be pushed as real
+        content the moment this user sends anything back — i.e. a
+        re-engagement template was already sent for it, but the actual
+        message never went out (sent_at IS NULL). Checked on every
+        incoming message so a reply reopening the session window
+        immediately triggers delivery of the held content."""
+        with self._get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            cur.execute('''
+                SELECT * FROM premium_plans
+                WHERE phone_number = %s
+                  AND sent_at IS NULL
+                  AND template_nudge_sent_at IS NOT NULL
+                ORDER BY day_number ASC
+                LIMIT 1
+            ''', (phone_number,))
             row = cur.fetchone()
             return dict(row) if row else None
 

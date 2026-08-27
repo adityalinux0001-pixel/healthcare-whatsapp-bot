@@ -517,6 +517,102 @@ async def classify_premium_intent(
     return await _classify_premium_intent(client, user_text, recent_context)
 
 
+async def _classify_payment_status_intent(
+    client: "genai.Client",
+    user_text: str,
+    recent_context: str = "",
+) -> dict:
+    """
+    Second-stage classifier — call this ONLY on messages that
+    _classify_premium_intent already flagged premium_related=True.
+    Narrows further: is the user asking whether THEIR OWN payment has
+    actually gone through / whether they're currently subscribed
+    ("is my payment done", "payment status", "have I paid", "money got
+    deducted but no confirmation", "am I premium"), as opposed to
+    general interest, pricing questions, or an explicit request for a
+    NEW payment link ("send me the link")?
+
+    Kept as a separate call (rather than folded into
+    _classify_premium_intent's single prompt) so each classifier stays
+    a small, single-purpose decision — same rationale as
+    _classify_premium_intent vs _detect_reply_language being separate
+    calls instead of one overloaded prompt.
+
+    Returns {"payment_status_query": bool}. Fails closed to False on
+    any error: a missed status check just falls through to the normal
+    premium-offer flow, which is a safe, recoverable default (mirrors
+    _classify_premium_intent's fail-closed rationale).
+    """
+    stripped = user_text.strip()
+    if not stripped:
+        return {"payment_status_query": False}
+
+    prompt_parts = []
+    if recent_context:
+        prompt_parts.append(f"Recent conversation (oldest to newest):\n{recent_context}\n")
+    prompt_parts.append(f"CURRENT user message: {stripped[:500]}")
+    contents_text = "\n".join(prompt_parts)
+
+    try:
+        response = await _call_gemini(
+            lambda: client.aio.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[types.Part(text=contents_text)],
+                config=types.GenerateContentConfig(
+                    system_instruction=(
+                        "You are an intent classifier for a WhatsApp health "
+                        "bot's paid premium plan. The current message has "
+                        "already been flagged as related to the premium "
+                        "plan/payment/subscription. Decide ONE boolean:\n\n"
+                        "payment_status_query: Is the user asking whether "
+                        "THEIR OWN payment has actually gone through, or "
+                        "whether they are currently subscribed? Examples: "
+                        "'is my payment done', 'payment status', 'have I "
+                        "paid', 'money got deducted but no confirmation', "
+                        "'am I premium', 'did my payment go through'.\n"
+                        "   - FALSE if they're asking about price, what's "
+                        "included, or asking to receive a NEW payment link "
+                        "('send me the link', 'how do I pay', 'I want to "
+                        "buy').\n"
+                        "   - FALSE if they're just expressing interest or "
+                        "asking general questions about the plan.\n\n"
+                        "Respond ONLY with a raw JSON object (no markdown, "
+                        "no explanations):\n"
+                        '{"payment_status_query": true|false}'
+                    ),
+                    max_output_tokens=30,
+                    temperature=0.0,
+                ),
+            ),
+            label="payment status intent classification",
+        )
+        raw = (response.text or "").strip()
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        parsed = _json.loads(raw)
+        return {"payment_status_query": bool(parsed.get("payment_status_query", False))}
+    except Exception as e:
+        logger.warning(
+            f"Payment status intent classification failed, defaulting to False: {e}"
+        )
+        return {"payment_status_query": False}
+
+
+async def classify_payment_status_intent(
+    user_text: str,
+    recent_context: str = "",
+) -> dict:
+    """
+    Public wrapper around _classify_payment_status_intent() for callers
+    outside this module (main.py). Call this only when
+    classify_premium_intent() has already returned premium_related=True
+    for the same message — see that function's docstring.
+    """
+    client = _get_client()
+    return await _classify_payment_status_intent(client, user_text, recent_context)
+
+
 SYSTEM_PROMPT = """You are an AI WhatsApp health assistant—a knowledgeable, caring guide (not a doctor) providing clear, practical, evidence-based information.
 
 ROLE

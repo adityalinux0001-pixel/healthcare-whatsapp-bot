@@ -28,12 +28,12 @@ single entry point one job invocation should call once per day.
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from app.core.config import get_settings
 from app.services.memory import ConversationMemory
-from app.services.whatsapp import send_text_message
+from app.services.whatsapp import send_text_message, send_template_message
 
 logger = logging.getLogger("daily_checkin")
 
@@ -94,6 +94,51 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
     header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
     message = header + plan_day["message_text"]
     followup_question = plan_day.get("followup_question")
+
+    # WhatsApp only delivers free-form text within ~24h of the user's
+    # last INBOUND message. Outside that window, send_text_message still
+    # gets a 200 OK from Meta (shows up as "sent" in logs) but the
+    # message is never actually delivered to the phone — this is exactly
+    # what a stuck-at-"sent" check-in looks like. If the window's closed,
+    # send an approved re-engagement TEMPLATE instead and hold the real
+    # content: the webhook handler pushes it the moment this user
+    # replies to anything (see _flush_pending_checkin_day in main.py).
+    last_inbound_at = await asyncio.to_thread(memory.get_last_inbound_message_at, phone_number)
+    window_open = False
+    if last_inbound_at is not None:
+        if last_inbound_at.tzinfo is not None:
+            last_inbound_at = last_inbound_at.replace(tzinfo=None)
+        window_open = (now - last_inbound_at) < timedelta(hours=settings.WHATSAPP_SESSION_WINDOW_HOURS)
+
+    if not window_open:
+        if not settings.DAILY_CHECKIN_REENGAGEMENT_TEMPLATE:
+            logger.warning(
+                f"⚠️ Session window closed for {phone_number} (day {day_number}) and no "
+                f"DAILY_CHECKIN_REENGAGEMENT_TEMPLATE configured — sending as free text "
+                f"anyway, but this will very likely show 'sent' and never be delivered. "
+                f"Set DAILY_CHECKIN_REENGAGEMENT_TEMPLATE to an approved template to fix this."
+            )
+        else:
+            try:
+                await send_template_message(
+                    phone_number,
+                    settings.DAILY_CHECKIN_REENGAGEMENT_TEMPLATE,
+                    params=[str(day_number)],
+                )
+                await asyncio.to_thread(
+                    memory.mark_plan_day_template_nudge_sent, phone_number, day_number
+                )
+                logger.info(
+                    f"📨 Session window closed for {phone_number} — sent re-engagement "
+                    f"template for day {day_number} instead; holding real content until "
+                    f"they reply."
+                )
+            except Exception as e:
+                logger.error(
+                    f"❌ Failed to send re-engagement template for {phone_number} day "
+                    f"{day_number}: {e}", exc_info=True,
+                )
+            return
 
     try:
         await send_text_message(phone_number, message)
