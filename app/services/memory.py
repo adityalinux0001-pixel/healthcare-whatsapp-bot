@@ -282,6 +282,7 @@ class ConversationMemory:
                     followup_answered_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ DEFAULT now(),
                     sent_at TIMESTAMPTZ,
+                    send_claimed_at TIMESTAMPTZ,
                     -- awaiting_followup marks the window between "today's
                     -- message was just sent" and "the user has answered (or
                     -- the next day's message supersedes it)" — the webhook
@@ -313,6 +314,10 @@ class ConversationMemory:
             cur.execute('''
                 ALTER TABLE premium_plans
                 ADD COLUMN IF NOT EXISTS template_nudge_sent_at TIMESTAMPTZ
+            ''')
+            cur.execute('''
+                ALTER TABLE premium_plans
+                ADD COLUMN IF NOT EXISTS send_claimed_at TIMESTAMPTZ
             ''')
 
 
@@ -614,23 +619,15 @@ class ConversationMemory:
     def mark_payment_link_paid(self, payment_link_id: str, razorpay_payment_id: str) -> Optional[str]:
         with self._get_conn() as conn:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT phone_number, status FROM payment_links WHERE payment_link_id = %s",
-                (payment_link_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            phone_number, status = row
-            if status == "paid":
-                return phone_number
             cur.execute('''
                 UPDATE payment_links
                 SET status = 'paid', razorpay_payment_id = %s, paid_at = %s
-                WHERE payment_link_id = %s
+                WHERE payment_link_id = %s AND status <> 'paid'
+                RETURNING phone_number
             ''', (razorpay_payment_id, datetime.utcnow(), payment_link_id))
+            row = cur.fetchone()
             conn.commit()
-            return phone_number
+            return row[0] if row else None
 
     def activate_subscription(self, phone_number: str, days: int, payment_link_id: str,
                                plan_name: str = "premium_21day") -> str:
@@ -885,6 +882,30 @@ class ConversationMemory:
             ''', (phone_number, day_number))
             row = cur.fetchone()
             return dict(row) if row else None
+
+    def claim_plan_day_for_send(self, phone_number: str, day_number: int) -> bool:
+        """Atomically reserve an unsent plan day for one worker.
+
+        A short lease makes a crashed worker retryable, while concurrent
+        webhook/check-in workers cannot both send the same day.
+        """
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE premium_plans
+                SET send_claimed_at = now()
+                WHERE phone_number = %s
+                  AND day_number = %s
+                  AND sent_at IS NULL
+                  AND (
+                      send_claimed_at IS NULL
+                      OR send_claimed_at < now() - INTERVAL '10 minutes'
+                  )
+                RETURNING id
+            ''', (phone_number, day_number))
+            claimed = cur.fetchone() is not None
+            conn.commit()
+            return claimed
 
     def get_last_inbound_message_at(self, phone_number: str) -> Optional[datetime]:
         """The timestamp of this user's most recent INBOUND (role='user')

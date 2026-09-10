@@ -1,32 +1,47 @@
 """
-Onboarding question flow — runs ONCE, immediately after a user subscribes
-(right after payment is confirmed), before the single "generate the whole
-21-day plan" LLM call.
+Onboarding question flow — runs ONCE, now starting immediately on a
+user's first message ("hi"/"hello"/etc.), BEFORE payment, so a
+non-premium user's free Q&A (see settings.FREE_QUESTION_LIMIT in
+app/main.py) can be personalized right away. Generating the actual paid
+21-day plan is a SEPARATE step gated on payment — see generate_and_send_plan().
 
-Flow (matches the updated architecture diagram):
+Flow:
 
-    User subscribes
+    User's first message ("hi")
         -> Category selection (default: weight_loss; more categories added
            later purely as new entries in QUESTIONS_BY_CATEGORY / app.llm's
            PLAN_CATEGORY_PROMPTS — nothing else changes)
         -> Onboarding questions (7 profile questions + 1 "what time should
-           I check in daily?" question, one at a time via WhatsApp)
-        -> LLM generates full plan (ONE call — app.llm.generate_premium_plan)
-        -> Saved to database (app.memory.save_premium_plan), preferred
-           check-in hour saved (app.memory.set_preferred_checkin_hour)
-        -> Day 1 is sent IMMEDIATELY, right here, instead of waiting for
-           the scheduler's next run
+           I check in daily?" question, one at a time via WhatsApp) — FREE,
+           no payment required
+        -> Onboarding complete (_finish_onboarding): answers + preferred
+           check-in hour are saved. If the user isn't premium yet (the
+           normal case), they're invited to ask questions now — up to
+           settings.FREE_QUESTION_LIMIT free answers before the payment
+           pitch takes over (see app/main.py's free-question gate).
+        -> Once/if the user pays, app/main.py's /razorpay/webhook handler
+           calls generate_and_send_plan(): ONE LLM call
+           (app.llm.generate_premium_plan) generates the full plan from the
+           already-saved onboarding answers, it's saved to the database
+           (app.memory.save_premium_plan), and Day 1 is sent IMMEDIATELY,
+           instead of waiting for the scheduler's next run.
         -> Daily scheduler takes over from Day 2 onward (app/daily_checkin.py),
            sending each user's check-in at THEIR preferred hour
 
-This module owns steps 2-5. app/main.py calls into it from two places:
-  1. Right after subscription activation (razorpay webhook handler) ->
+This module owns onboarding + plan generation. app/main.py calls into it
+from three places:
+  1. On a user's first-ever message (_maybe_send_greeting) ->
      start_onboarding(phone_number).
   2. On every incoming text message, BEFORE normal Q&A routing, if the user
      has an onboarding session in progress -> handle_onboarding_reply(...).
      Returns True if the message was consumed as an onboarding answer (so
      main.py should stop processing that message normally), False
      otherwise.
+  3. Right after subscription activation (razorpay webhook handler), if
+     onboarding was already complete at that point -> generate_and_send_plan
+     (phone_number). (If onboarding wasn't complete yet, _finish_onboarding
+     detects the now-active subscription itself and generates the plan the
+     moment onboarding finishes instead.)
 """
 
 import asyncio
@@ -351,22 +366,31 @@ async def start_onboarding(
     )
 
 
-async def _finish_onboarding_and_generate_plan(
+async def _finish_onboarding(
     memory: ConversationMemory, phone_number: str
 ) -> None:
     """
-    Last answer just came in. Mark the session complete, make the SINGLE
-    LLM call that generates all {premium_plan_days} days + follow-up
-    questions, save the whole plan to the database, and tell the user
-    it's ready. If plan generation fails, the user is told to hang tight
-    and nothing partial is saved — safe to retry by re-triggering
-    onboarding completion (e.g. an admin re-running this function).
+    Last onboarding answer just came in. Mark the session complete and
+    save the preferred check-in hour — both independent of payment
+    status, since the collected profile is also used to personalize the
+    free Q&A a non-premium user gets (see settings.FREE_QUESTION_LIMIT
+    in app/main.py).
+
+    Onboarding is now FREE and starts on the user's first "hi", before
+    any payment (see app/main.py's _maybe_send_greeting). The full PAID
+    21-day plan is only ever generated once the user is ALSO a paying
+    subscriber:
+      - If they're somehow ALREADY premium right this moment (paid
+        before/during onboarding — an edge case) -> generate and send
+        the plan immediately, same as the old combined behavior.
+      - Otherwise (the normal case) -> tell them they're set and invite
+        them to ask questions now; the actual plan gets generated later,
+        from the /razorpay/webhook handler in app/main.py, the moment
+        their payment lands.
     """
     session = await asyncio.to_thread(memory.mark_onboarding_complete, phone_number)
-    answers = session.get("answers", {}) or {}
-    category = session.get("category") or settings.DEFAULT_PLAN_CATEGORY
 
-    raw_time_answer = answers.get("preferred_checkin_time", "")
+    raw_time_answer = (session.get("answers") or {}).get("preferred_checkin_time", "")
     preferred_hour_utc = _parse_preferred_hour_to_utc(raw_time_answer) if raw_time_answer else None
     if preferred_hour_utc is None:
         preferred_hour_utc = settings.DAILY_CHECKIN_HOUR_UTC
@@ -375,6 +399,52 @@ async def _finish_onboarding_and_generate_plan(
             f"{phone_number} - falling back to default hour {preferred_hour_utc}:00 UTC."
         )
     await asyncio.to_thread(memory.set_preferred_checkin_hour, phone_number, preferred_hour_utc)
+
+    if await asyncio.to_thread(memory.is_premium_active, phone_number):
+        # Rare ordering (paid before finishing onboarding) — behave
+        # exactly like the old combined flow and generate the plan now.
+        await generate_and_send_plan(memory, phone_number, session=session)
+        return
+
+    outro = (
+        "Perfect, thank you! 🙏 I've got everything I need to personalize "
+        "my answers for you.\n\n"
+        "Go ahead and ask me anything about your health, diet, or fitness "
+        "goals 💬"
+    )
+    await send_text_message(phone_number, outro)
+    await asyncio.to_thread(
+        memory.save_message, phone_number, "assistant", outro, message_type="text"
+    )
+
+
+async def generate_and_send_plan(
+    memory: ConversationMemory, phone_number: str, session: Optional[dict] = None
+) -> None:
+    """
+    Generate the full {PREMIUM_PLAN_DAYS}-day plan from this user's
+    already-saved onboarding answers (one LLM call), save it, and send
+    Day 1 immediately. Requires onboarding to already be complete.
+
+    Call this from exactly two places:
+      1. _finish_onboarding() above, if the user is ALREADY premium the
+         moment onboarding finishes.
+      2. The /razorpay/webhook handler in app/main.py, once payment
+         lands — the normal case now, since onboarding usually finishes
+         well before payment.
+
+    `session` (the dict returned by mark_onboarding_complete /
+    get_onboarding_session — needs "answers" and "category") can be
+    passed in to avoid a redundant DB round-trip; if omitted, it's
+    fetched here instead.
+
+    If plan generation fails, the user is told to hang tight and nothing
+    partial is saved — safe to retry by calling this again.
+    """
+    if session is None:
+        session = await asyncio.to_thread(memory.get_onboarding_session, phone_number)
+    answers = (session or {}).get("answers", {}) or {}
+    category = (session or {}).get("category") or settings.DEFAULT_PLAN_CATEGORY
 
     await send_text_message(
         phone_number,
@@ -424,7 +494,6 @@ async def _finish_onboarding_and_generate_plan(
         memory.save_message, phone_number, "assistant", confirm, message_type="text"
     )
 
-
     await _send_plan_day_now(memory, phone_number, day_number=1)
 
 
@@ -445,6 +514,16 @@ async def _send_plan_day_now(
         logger.error(
             f"❌ Tried to immediately send day {day_number} for {phone_number} but "
             "no such pregenerated row exists — skipping."
+        )
+        return
+
+    claimed = await asyncio.to_thread(
+        memory.claim_plan_day_for_send, phone_number, day_number
+    )
+    if not claimed:
+        logger.info(
+            f"⏭️ Day {day_number} for {phone_number} is already being sent or was sent; "
+            "skipping duplicate delivery."
         )
         return
 
@@ -489,7 +568,7 @@ async def handle_onboarding_reply(
         # Defensive: shouldn't happen (mark_onboarding_complete runs on the
         # last answer), but don't let a stuck session swallow messages
         # forever.
-        await _finish_onboarding_and_generate_plan(memory, phone_number)
+        await _finish_onboarding(memory, phone_number)
         return True
 
     current_key, current_prompt = questions[question_index]
@@ -520,12 +599,12 @@ async def handle_onboarding_reply(
         # dict is what we've just confirmed IS extractable from it, used
         # here only to gate acceptance. preferred_checkin_time's raw text
         # is still what _parse_preferred_hour_to_utc re-parses later in
-        # _finish_onboarding_and_generate_plan.
+        # _finish_onboarding.
         new_index = await asyncio.to_thread(
             memory.save_onboarding_answer, phone_number, current_key, user_text
         )
         if new_index >= len(questions):
-            await _finish_onboarding_and_generate_plan(memory, phone_number)
+            await _finish_onboarding(memory, phone_number)
             return True
         next_key, next_prompt = questions[new_index]
         await send_text_message(phone_number, next_prompt)
@@ -568,7 +647,7 @@ async def handle_onboarding_reply(
     )
 
     if new_index >= len(questions):
-        await _finish_onboarding_and_generate_plan(memory, phone_number)
+        await _finish_onboarding(memory, phone_number)
         return True
 
     next_key, next_prompt = questions[new_index]

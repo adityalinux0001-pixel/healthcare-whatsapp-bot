@@ -140,6 +140,16 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
                 )
             return
 
+    claimed = await asyncio.to_thread(
+        memory.claim_plan_day_for_send, phone_number, day_number
+    )
+    if not claimed:
+        logger.info(
+            f"⏭️ Day {day_number} for {phone_number} is already being sent or was sent; "
+            "skipping duplicate delivery."
+        )
+        return
+
     try:
         await send_text_message(phone_number, message)
         await asyncio.to_thread(memory.mark_plan_day_sent, phone_number, day_number)

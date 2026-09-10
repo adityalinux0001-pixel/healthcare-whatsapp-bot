@@ -53,7 +53,7 @@ from app.services.audio_handler import (
 )
 from app.core.queueing import enqueue_incoming
 from app.services.razorpay_client import create_payment_link, verify_webhook_signature
-from app.services.onboarding import start_onboarding, handle_onboarding_reply
+from app.services.onboarding import start_onboarding, handle_onboarding_reply, generate_and_send_plan
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -219,13 +219,23 @@ async def generate_context_aware_response(
     async def _get_customer():
         return await asyncio.to_thread(memory.get_customer, phone_number)
 
+    async def _get_onboarding_profile():
+        return await asyncio.to_thread(memory.get_onboarding_session, phone_number)
+
     async def _get_language():
         return await detect_reply_language(user_message, whisper_language)
 
-    context_text, customer_data, required_language = await asyncio.gather(
-        _get_context(), _get_customer(), _get_language()
+    context_text, customer_data, onboarding_session, required_language = await asyncio.gather(
+        _get_context(), _get_customer(), _get_onboarding_profile(), _get_language()
     )
     customer_summary = customer_data.get("summary", "")
+    onboarding_answers = (onboarding_session or {}).get("answers") or {}
+    if isinstance(onboarding_answers, str):
+        try:
+            onboarding_answers = json.loads(onboarding_answers)
+        except json.JSONDecodeError:
+            onboarding_answers = {"saved_profile": onboarding_answers}
+    onboarding_profile = json.dumps(onboarding_answers, ensure_ascii=False, indent=2)
 
 
     session_age = await asyncio.to_thread(memory.get_symptom_session_age_seconds, phone_number)
@@ -264,6 +274,9 @@ HARD OVERRIDE — READ FIRST: You have already asked {questions_asked_so_far} in
 [CUSTOMER SUMMARY]
 {customer_summary if customer_summary else "No prior context available"}
 
+[SAVED ONBOARDING PROFILE]
+{onboarding_profile if onboarding_answers else "No onboarding profile saved yet"}
+
 {context_text if context_text else "[No previous messages]"}
 
 [CURRENT USER MESSAGE]
@@ -271,7 +284,9 @@ HARD OVERRIDE — READ FIRST: You have already asked {questions_asked_so_far} in
 
 Answer only the current user message directly and briefly. Use the conversation context solely for consistency—do not re-summarize or restate past messages.
 
-CRITICAL INTAKE CHECK: Review [CUSTOMER SUMMARY] and context carefully. If in SYMPTOM INTAKE MODE, NEVER ask for details (duration, severity, etc.) already provided. Ask only for the next missing detail. If all necessary information is present, stop questioning and provide your final guidance.
+The SAVED ONBOARDING PROFILE contains the user's answers collected earlier. Treat those answers as authoritative facts for this user. Do not ask the user again for any detail that is present there, even if it is not repeated in recent conversation history. If the profile contains a field such as age, gender, weight, height, goal, diet, activity, medical conditions, routine, or past attempts, use it when relevant and never ask for it again unless the user clearly says it has changed.
+
+CRITICAL INTAKE CHECK: Review [SAVED ONBOARDING PROFILE], [CUSTOMER SUMMARY], and context carefully. If in SYMPTOM INTAKE MODE, NEVER ask for details (duration, severity, etc.) already provided. Ask only for the next missing detail. If all necessary information is present, stop questioning and provide your final guidance.
 {force_answer_instruction}
 {topic_switch_instruction}
     """.strip()
@@ -573,24 +588,27 @@ _GREETING_WORDS = ("hi", "hii", "hiii", "hello", "hey", "heya", "yo", "namaste")
 async def _maybe_send_greeting(phone_number: str) -> bool:
     """
     For a message that does NOT show premium interest (see
-    _shows_premium_interest / now classify_premium_intent) — typically a first "hii"/"hello" — send a
-    warm, low-key intro instead of the full payment-link pitch: who the
-    bot is, plus a single soft one-liner mentioning the 21-day plan
-    exists, with NO link and NO price breakdown. The idea is to
-    introduce the paid plan only after the user has actually shown
-    interest in their health goal, rather than leading with a sales
-    pitch on "hii".
+    _shows_premium_interest / now classify_premium_intent) — typically a
+    first "hii"/"hello" — send a short welcome and immediately KICK OFF
+    ONBOARDING (see app.services.onboarding.start_onboarding) instead of
+    a static intro. Onboarding no longer waits for payment: the user
+    answers the onboarding questions first, those answers are saved
+    (handle_onboarding_reply, called earlier in _handle_incoming, is
+    what actually captures each answer turn-by-turn), and afterwards the
+    bot answers using that profile — up to settings.FREE_QUESTION_LIMIT
+    free questions (see the gate in _handle_incoming) before the
+    payment-link pitch takes over.
 
     Skipped entirely for users with an active premium subscription (they
-    don't need to be told the plan exists), and only sent on this user's
-    FIRST-EVER message (message_count == 0 before this turn's save) so a
-    chatty user doesn't get the same "by the way" intro repeated on
-    every plain "hii"/"hello" they happen to send later.
+    already have a profile and don't need to be re-onboarded), and only
+    fires on this user's FIRST-EVER message (message_count == 0 before
+    this turn's save) so a chatty user doesn't get re-onboarded every
+    time they happen to say "hii"/"hello" again later.
 
-    Returns True if the greeting was actually sent (caller should treat
-    this as the full reply for the turn and stop — see call site in
-    _handle_incoming), False if skipped for any reason (caller should
-    fall through to normal Q&A handling instead).
+    Returns True if the welcome + onboarding kickoff were actually sent
+    (caller should treat this as the full reply for the turn and stop —
+    see call site in _handle_incoming), False if skipped for any reason
+    (caller should fall through to normal Q&A handling instead).
     """
     try:
         if await asyncio.to_thread(memory.is_premium_active, phone_number):
@@ -598,25 +616,31 @@ async def _maybe_send_greeting(phone_number: str) -> bool:
 
         message_count = await asyncio.to_thread(memory.get_message_count, phone_number)
         if message_count > 0:
-            # Not this user's first message — they've already seen either
-            # this greeting or other bot replies before; don't repeat it.
+            # Not this user's first message — onboarding has already
+            # started (or finished) for them; don't restart it.
             return False
 
-        greeting_text = (
+        welcome_text = (
             "Hi! 👋 I'm your AI health assistant — happy to help with diet, "
             "workouts, or any health questions you've got.\n\n"
-            "By the way, if you're working on a weight-loss (or other health) "
-            "goal, I also run a 21-day guided plan with daily check-ins — "
-            "just tell me a bit about your goal if you'd like to hear more 🙂"
+            "Let's quickly get to know you so I can personalize my answers 🙂"
         )
-        await send_text_message(phone_number, greeting_text)
+        await send_text_message(phone_number, welcome_text)
         await asyncio.to_thread(
-            memory.save_message, phone_number, "assistant", greeting_text, message_type="text"
+            memory.save_message, phone_number, "assistant", welcome_text, message_type="text"
         )
-        logger.info(f"👋 Sent low-key greeting/intro to {phone_number}")
+
+        # Immediately start onboarding — this sends the first onboarding
+        # question. Every subsequent user reply is captured by
+        # handle_onboarding_reply() (checked first thing in
+        # _handle_incoming, before any intent classification) until
+        # onboarding is complete.
+        await start_onboarding(memory, phone_number, category=settings.DEFAULT_PLAN_CATEGORY)
+
+        logger.info(f"👋 Sent welcome + started onboarding for {phone_number}")
         return True
     except Exception as e:
-        logger.error(f"❌ Failed to send greeting for {phone_number}: {e}", exc_info=True)
+        logger.error(f"❌ Failed to send welcome/start onboarding for {phone_number}: {e}", exc_info=True)
         return False
 
 
@@ -757,7 +781,15 @@ async def _send_free_limit_message(
     Reuses an existing unpaid payment link when one is already on file,
     same pattern as _maybe_send_unpaid_plan_reminder, instead of minting
     a fresh Razorpay link on every single blocked question.
+
+    HARDENED: this used to be one big try/except around the whole body
+    that only logged on failure — a Razorpay error, a category-lookup
+    error, or a translation error meant the user got NOTHING back after
+    crossing the free-question limit (looked like the bot had gone
+    silent). Each risky step now degrades gracefully instead of
+    aborting the whole message.
     """
+    short_url = None
     try:
         latest_link = await asyncio.to_thread(
             memory.get_latest_payment_link_for_user, phone_number
@@ -777,41 +809,74 @@ async def _send_free_limit_message(
                 link.get("short_url"),
             )
             short_url = link["short_url"]
-
-        category = await asyncio.to_thread(memory.get_user_category, phone_number)
-        copy = _PREMIUM_OFFER_COPY.get(category, _DEFAULT_PREMIUM_OFFER_COPY)
-
-        if is_first_hit:
-            text = (
-                f"You've used up your {settings.FREE_QUESTION_LIMIT} free questions "
-                f"for now. 🙌\n\n"
-                f"To keep getting answers, grab our {settings.PREMIUM_PLAN_DAYS}-Day "
-                f"{copy['plan_name']} for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES} — you get:\n"
-                f"1. A daily action plan for {settings.PREMIUM_PLAN_DAYS} days — {copy['daily_item']}\n"
-                f"2. Priority, more detailed answers whenever you're stuck or plateauing\n"
-                f"3. {copy['adapt_line']}\n\n"
-                f"Pay here to keep going:\n{short_url}"
-            )
-        else:
-            text = (
-                f"Still here whenever you're ready 🙂\n\n"
-                f"Premium unlocks unlimited questions, a personalized "
-                f"{settings.PREMIUM_PLAN_DAYS}-day plan with daily check-ins, and "
-                f"priority answers — all for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES}.\n\n"
-                f"Grab it here:\n{short_url}"
-            )
-
-        text = await translate_premium_offer_text(text, required_language or "English")
-        await send_text_message(phone_number, text)
-        await asyncio.to_thread(
-            memory.save_message, phone_number, "assistant", text, message_type="text"
+    except Exception as e:
+        logger.error(
+            f"⚠️ Could not get/create payment link for {phone_number} — "
+            f"sending free-limit message without a link instead of nothing: {e}",
+            exc_info=True,
         )
+        short_url = None
+
+    try:
+        category = await asyncio.to_thread(memory.get_user_category, phone_number)
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to look up category for {phone_number}, using default copy: {e}")
+        category = None
+    copy = _PREMIUM_OFFER_COPY.get(category, _DEFAULT_PREMIUM_OFFER_COPY)
+
+    link_line = (
+        f"Pay here to keep going:\n{short_url}"
+        if short_url
+        else "Reply here and we'll get a payment link sent to you to keep going."
+    )
+
+    if is_first_hit:
+        text = (
+            f"You've used up your {settings.FREE_QUESTION_LIMIT} free questions "
+            f"for now. 🙌\n\n"
+            f"To keep getting answers, grab our {settings.PREMIUM_PLAN_DAYS}-Day "
+            f"{copy['plan_name']} for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES} — you get:\n"
+            f"1. A daily action plan for {settings.PREMIUM_PLAN_DAYS} days — {copy['daily_item']}\n"
+            f"2. Priority, more detailed answers whenever you're stuck or plateauing\n"
+            f"3. {copy['adapt_line']}\n\n"
+            f"{link_line}"
+        )
+    else:
+        text = (
+            f"Still here whenever you're ready 🙂\n\n"
+            f"Premium unlocks unlimited questions, a personalized "
+            f"{settings.PREMIUM_PLAN_DAYS}-day plan with daily check-ins, and "
+            f"priority answers — all for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES}.\n\n"
+            f"{link_line}"
+        )
+
+    try:
+        text = await translate_premium_offer_text(text, required_language or "English")
+    except Exception as e:
+        logger.warning(
+            f"⚠️ Failed to translate free-limit message for {phone_number}, "
+            f"sending untranslated instead of nothing: {e}"
+        )
+
+    try:
+        await send_text_message(phone_number, text)
         logger.info(
             f"🚫 Free question limit reached for {phone_number} "
             f"(first_hit={is_first_hit}) — sent app features + link instead of an answer."
         )
     except Exception as e:
         logger.error(f"❌ Failed to send free-limit message for {phone_number}: {e}", exc_info=True)
+        return
+
+    try:
+        await asyncio.to_thread(
+            memory.save_message, phone_number, "assistant", text, message_type="text"
+        )
+    except Exception as e:
+        logger.error(
+            f"⚠️ Free-limit message was sent to {phone_number} but failed to save to history: {e}",
+            exc_info=True,
+        )
 
 
 async def _flush_pending_checkin_day(phone_number: str, plan_day: dict) -> None:
@@ -828,6 +893,16 @@ async def _flush_pending_checkin_day(phone_number: str, plan_day: dict) -> None:
     because a user didn't message for a day or two.
     """
     day_number = plan_day["day_number"]
+    claimed = await asyncio.to_thread(
+        memory.claim_plan_day_for_send, phone_number, day_number
+    )
+    if not claimed:
+        logger.info(
+            f"⏭️ Held day {day_number} for {phone_number} is already being sent or was sent; "
+            "skipping duplicate delivery."
+        )
+        return
+
     header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
     message = header + plan_day["message_text"]
     followup_question = plan_day.get("followup_question")
@@ -1067,6 +1142,15 @@ async def razorpay_webhook(request: Request):
         memory.mark_payment_link_paid, payment_link_id, razorpay_payment_id
     )
     if not phone_number:
+        existing_payment = await asyncio.to_thread(
+            memory.get_payment_link, payment_link_id
+        )
+        if existing_payment and existing_payment.get("status") == "paid":
+            logger.info(
+                f"⏭️ Duplicate payment webhook for {payment_link_id}, skipping."
+            )
+            return {"status": "ok"}
+
         logger.warning(
             f"⚠️ Razorpay webhook: no local record for payment_link_id={payment_link_id}"
         )
@@ -1143,9 +1227,35 @@ async def razorpay_webhook(request: Request):
 
 
     try:
-        await start_onboarding(memory, phone_number, category=settings.DEFAULT_PLAN_CATEGORY)
+        # Onboarding now normally already ran (for FREE) when this user
+        # first said "hi" (see _maybe_send_greeting), well before they
+        # ever paid. Payment landing is what should trigger the actual
+        # paid plan generation + Day 1 send now — see
+        # app.services.onboarding.generate_and_send_plan().
+        session = await asyncio.to_thread(memory.get_onboarding_session, phone_number)
+        if session and session.get("is_complete"):
+            # Normal case: onboarding already finished, so generate and
+            # send the paid plan right now using those saved answers.
+            await generate_and_send_plan(memory, phone_number, session=session)
+        elif session and not session.get("is_complete"):
+            # User is mid-onboarding when payment landed. Nothing to do
+            # here — _finish_onboarding() checks is_premium_active() the
+            # moment they answer the last question and will generate the
+            # plan itself right then, since the subscription is already
+            # active by that point.
+            logger.info(
+                f"ℹ️ {phone_number} paid mid-onboarding — plan will "
+                f"generate automatically once they finish answering."
+            )
+        else:
+            # Edge case: payment landed without the user ever messaging
+            # the bot first, so onboarding never had a chance to start.
+            # Kick it off now — _finish_onboarding will see this user is
+            # already premium and generate the plan itself once
+            # onboarding finishes.
+            await start_onboarding(memory, phone_number, category=settings.DEFAULT_PLAN_CATEGORY)
     except Exception as e:
-        logger.error(f"❌ Failed to start onboarding for {phone_number}: {e}", exc_info=True)
+        logger.error(f"❌ Failed to trigger onboarding/plan generation for {phone_number}: {e}", exc_info=True)
 
     return {"status": "ok"}
 
@@ -1405,7 +1515,11 @@ Type /stats to see your conversation statistics.
                 await asyncio.to_thread(
                     memory.save_message, sender, "user", user_text, message_type="text"
                 )
-                gate_required_language = await detect_reply_language(user_text)
+                try:
+                    gate_required_language = await detect_reply_language(user_text)
+                except Exception as e:
+                    logger.warning(f"⚠️ Language detection failed for {sender}, defaulting to English: {e}")
+                    gate_required_language = None
                 await _send_free_limit_message(
                     sender,
                     is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
@@ -1532,7 +1646,14 @@ Type /stats to see your conversation statistics.
                         message_type="audio", audio_file_path=audio_path,
                         audio_transcription=transcription,
                     )
-                    gate_required_language = whisper_language or await detect_reply_language(transcription)
+                    if whisper_language:
+                        gate_required_language = whisper_language
+                    else:
+                        try:
+                            gate_required_language = await detect_reply_language(transcription)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Language detection failed for {sender}, defaulting to English: {e}")
+                            gate_required_language = None
                     await _send_free_limit_message(
                         sender,
                         is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
@@ -1633,7 +1754,11 @@ Type /stats to see your conversation statistics.
                             memory.save_message, sender, "user",
                             f"[Sent an Image]: {image_description}", message_type="text",
                         )
-                        gate_required_language = await detect_reply_language(image_description)
+                        try:
+                            gate_required_language = await detect_reply_language(image_description)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Language detection failed for {sender}, defaulting to English: {e}")
+                            gate_required_language = None
                         await _send_free_limit_message(
                             sender,
                             is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
