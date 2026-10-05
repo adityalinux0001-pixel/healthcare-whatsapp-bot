@@ -320,6 +320,31 @@ class ConversationMemory:
                 ADD COLUMN IF NOT EXISTS send_claimed_at TIMESTAMPTZ
             ''')
 
+            # Daily task confirmation (Done / Not done buttons). A day's
+            # task_status is NULL until the user confirms; the NEXT day is
+            # only sent once the previous day has a non-NULL task_status.
+            # One-time backfill: plans already running when this column is
+            # first added get their already-sent days marked 'legacy', so
+            # existing premium users are not blocked by the new gate.
+            cur.execute('''
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'premium_plans' AND column_name = 'task_status'
+            ''')
+            task_status_exists = cur.fetchone() is not None
+            cur.execute('''
+                ALTER TABLE premium_plans
+                ADD COLUMN IF NOT EXISTS task_status TEXT
+            ''')
+            cur.execute('''
+                ALTER TABLE premium_plans
+                ADD COLUMN IF NOT EXISTS task_confirmed_at TIMESTAMPTZ
+            ''')
+            if not task_status_exists:
+                cur.execute('''
+                    UPDATE premium_plans SET task_status = 'legacy'
+                    WHERE sent_at IS NOT NULL AND task_status IS NULL
+                ''')
+
 
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS onboarding_sessions (
@@ -940,20 +965,32 @@ class ConversationMemory:
             conn.commit()
 
     def get_pending_template_nudge_day(self, phone_number: str) -> Optional[Dict]:
-        """The plan day (if any) that's waiting to be pushed as real
-        content the moment this user sends anything back — i.e. a
-        re-engagement template was already sent for it, but the actual
-        message never went out (sent_at IS NULL). Checked on every
-        incoming message so a reply reopening the session window
-        immediately triggers delivery of the held content."""
+        """The plan day (if any) that was HELD back by the daily job (the
+        24h window was closed when it was due) and is now ready to be
+        pushed as real content the moment this user sends anything back.
+        template_nudge_sent_at doubles as the "held" marker (it is set
+        whether or not a re-engagement template is configured).
+
+        A held day is only returned once the PREVIOUS day has been
+        confirmed (task_status NOT NULL) — day 1 has no previous day.
+        Checked on every incoming message / button tap."""
         with self._get_conn() as conn:
             cur = conn.cursor(row_factory=dict_row)
             cur.execute('''
-                SELECT * FROM premium_plans
-                WHERE phone_number = %s
-                  AND sent_at IS NULL
-                  AND template_nudge_sent_at IS NOT NULL
-                ORDER BY day_number ASC
+                SELECT p.* FROM premium_plans p
+                WHERE p.phone_number = %s
+                  AND p.sent_at IS NULL
+                  AND p.template_nudge_sent_at IS NOT NULL
+                  AND (
+                      p.day_number = 1
+                      OR EXISTS (
+                          SELECT 1 FROM premium_plans q
+                          WHERE q.phone_number = p.phone_number
+                            AND q.day_number = p.day_number - 1
+                            AND q.task_status IS NOT NULL
+                      )
+                  )
+                ORDER BY p.day_number ASC
                 LIMIT 1
             ''', (phone_number,))
             row = cur.fetchone()
@@ -1017,10 +1054,65 @@ class ConversationMemory:
             cur = conn.cursor()
             cur.execute('''
                 UPDATE premium_plans
-                SET followup_answer = %s, followup_answered_at = now(), awaiting_followup = FALSE
+                SET followup_answer = %s, followup_answered_at = now(), awaiting_followup = FALSE,
+                    task_status = COALESCE(task_status, 'replied'),
+                    task_confirmed_at = COALESCE(task_confirmed_at, now())
                 WHERE phone_number = %s AND day_number = %s
             ''', (answer, phone_number, day_number))
             conn.commit()
+
+    def save_task_confirmation(self, phone_number: str, day_number: int, status: str) -> bool:
+        """Record the user's Done / Not done button tap for a plan day
+        ('done' or 'not_done') and close the follow-up window. This is
+        what unlocks the NEXT day's message. Returns False if no such
+        day exists (stale/forged button id)."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                UPDATE premium_plans
+                SET task_status = %s, task_confirmed_at = now(), awaiting_followup = FALSE
+                WHERE phone_number = %s AND day_number = %s AND sent_at IS NOT NULL
+                RETURNING id
+            ''', (status, phone_number, day_number))
+            ok = cur.fetchone() is not None
+            conn.commit()
+            return ok
+
+    def has_current_plan(self, phone_number: str) -> bool:
+        """True if a plan was already generated for the user's CURRENT
+        subscription (plan rows created at/after the subscription start).
+        A plan left over from a previous, expired subscription doesn't
+        count, so renewals still get a fresh plan."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT 1 FROM subscriptions s
+                JOIN premium_plans p ON p.phone_number = s.phone_number
+                WHERE s.phone_number = %s
+                  AND p.created_at >= s.started_at - INTERVAL '1 minute'
+                LIMIT 1
+            ''', (phone_number,))
+            return cur.fetchone() is not None
+
+    def get_paid_users_without_plan(self) -> List[str]:
+        """Safety net: active subscribers whose onboarding is complete but
+        who have NO plan for their current subscription (plan generation
+        failed / was interrupted after payment)."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT s.phone_number
+                FROM subscriptions s
+                JOIN onboarding_sessions o
+                  ON o.phone_number = s.phone_number AND o.is_complete = TRUE
+                WHERE s.expires_at > now()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM premium_plans p
+                      WHERE p.phone_number = s.phone_number
+                        AND p.created_at >= s.started_at - INTERVAL '1 minute'
+                  )
+            ''')
+            return [r[0] for r in cur.fetchall()]
 
     def has_premium_plan(self, phone_number: str) -> bool:
         with self._get_conn() as conn:

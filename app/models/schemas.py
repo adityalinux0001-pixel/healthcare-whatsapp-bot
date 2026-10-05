@@ -61,6 +61,9 @@ class IncomingMessage(BaseModel):
     text: Optional[TextObject] = None
     image: Optional[ImageObject] = None
     audio: Optional[AudioObject] = None
+    # WhatsApp interactive replies (button taps), e.g.
+    # {"type": "button_reply", "button_reply": {"id": "...", "title": "..."}}
+    interactive: Optional[dict] = None
 
     class Config:
         populate_by_name = True  # Allow 'from' field
@@ -148,6 +151,7 @@ class WebhookMessage(BaseModel):
     text: Optional[dict] = None
     image: Optional[dict] = None
     audio: Optional[dict] = None
+    interactive: Optional[dict] = None
     
     class Config:
         populate_by_name = True

@@ -28,12 +28,15 @@ single entry point one job invocation should call once per day.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 from app.core.config import get_settings
 from app.services.memory import ConversationMemory
-from app.services.whatsapp import send_text_message, send_template_message
+from app.services.whatsapp import send_template_message
+from app.services.plan_delivery import send_plan_day
+from app.services.onboarding import generate_and_send_plan
 
 logger = logging.getLogger("daily_checkin")
 
@@ -91,9 +94,23 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
         return
 
     day_number = plan_day["day_number"]
-    header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
-    message = header + plan_day["message_text"]
-    followup_question = plan_day.get("followup_question")
+
+    # CONFIRMATION GATE: tomorrow's task is only sent if the user confirmed
+    # the previous day's task (Done / Not done button, or a text reply to
+    # the follow-up). No confirmation = no reply inside 24h = closed WhatsApp
+    # window, so we simply don't send. The user is told this in the note
+    # attached to every daily message (settings.TASK_CONFIRM_NOTE). Nothing
+    # is sent and nothing is billed. Once they tap an old button the held
+    # day is pushed right away (see main.py::_flush_pending_checkin_day).
+    if day_number > 1:
+        prev_day = await asyncio.to_thread(memory.get_premium_plan_day, phone_number, day_number - 1)
+        if prev_day is not None and prev_day.get("sent_at") is not None and prev_day.get("task_status") is None:
+            await asyncio.to_thread(memory.mark_plan_day_template_nudge_sent, phone_number, day_number)
+            logger.info(
+                f"⏭️ Day {day_number} for {phone_number} NOT sent — day {day_number - 1} "
+                f"not confirmed yet. Holding until they confirm."
+            )
+            return
 
     # WhatsApp only delivers free-form text within ~24h of the user's
     # last INBOUND message. Outside that window, send_text_message still
@@ -111,34 +128,33 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
         window_open = (now - last_inbound_at) < timedelta(hours=settings.WHATSAPP_SESSION_WINDOW_HOURS)
 
     if not window_open:
-        if not settings.DAILY_CHECKIN_REENGAGEMENT_TEMPLATE:
-            logger.warning(
-                f"⚠️ Session window closed for {phone_number} (day {day_number}) and no "
-                f"DAILY_CHECKIN_REENGAGEMENT_TEMPLATE configured — sending as free text "
-                f"anyway, but this will very likely show 'sent' and never be delivered. "
-                f"Set DAILY_CHECKIN_REENGAGEMENT_TEMPLATE to an approved template to fix this."
-            )
-        else:
+        if settings.DAILY_CHECKIN_REENGAGEMENT_TEMPLATE:
+            # Optional (paid) fallback — only used when an approved template
+            # name is configured. Leave the setting empty to send nothing.
             try:
                 await send_template_message(
                     phone_number,
                     settings.DAILY_CHECKIN_REENGAGEMENT_TEMPLATE,
                     params=[str(day_number)],
                 )
-                await asyncio.to_thread(
-                    memory.mark_plan_day_template_nudge_sent, phone_number, day_number
-                )
                 logger.info(
                     f"📨 Session window closed for {phone_number} — sent re-engagement "
-                    f"template for day {day_number} instead; holding real content until "
-                    f"they reply."
+                    f"template for day {day_number}; holding real content until they reply."
                 )
             except Exception as e:
                 logger.error(
                     f"❌ Failed to send re-engagement template for {phone_number} day "
                     f"{day_number}: {e}", exc_info=True,
                 )
-            return
+        else:
+            logger.info(
+                f"⏭️ Session window closed for {phone_number} (day {day_number}) — "
+                f"holding it; it will be sent as soon as they message again."
+            )
+        # Held marker (see memory.get_pending_template_nudge_day): the next
+        # inbound message from this user pushes the real content.
+        await asyncio.to_thread(memory.mark_plan_day_template_nudge_sent, phone_number, day_number)
+        return
 
     claimed = await asyncio.to_thread(
         memory.claim_plan_day_for_send, phone_number, day_number
@@ -150,29 +166,7 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
         )
         return
 
-    try:
-        await send_text_message(phone_number, message)
-        await asyncio.to_thread(memory.mark_plan_day_sent, phone_number, day_number)
-        await asyncio.to_thread(
-            memory.save_message, phone_number, "assistant", message, message_type="text"
-        )
-        logger.info(f"✅ Sent day {day_number}/{settings.PREMIUM_PLAN_DAYS} check-in to {phone_number}")
-    except Exception as e:
-        logger.error(f"❌ Failed to send/save check-in for {phone_number}: {e}", exc_info=True)
-        return
-
-
-    if followup_question:
-        try:
-            await send_text_message(phone_number, followup_question)
-            await asyncio.to_thread(
-                memory.save_message, phone_number, "assistant", followup_question, message_type="text"
-            )
-        except Exception as e:
-            logger.error(
-                f"❌ Failed to send follow-up question for {phone_number} day {day_number}: {e}",
-                exc_info=True,
-            )
+    await send_plan_day(memory, phone_number, plan_day)
 
 
 async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
@@ -222,6 +216,30 @@ async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
     logger.info(f"📅 Daily check-in run finished for hour {current_hour_utc}:00 UTC.")
 
 
+async def repair_missing_plans() -> None:
+    """
+    Safety net for the "paid but Day 1 never arrived" case: any active
+    subscriber who finished onboarding but has NO plan for their current
+    subscription (Gemini was down, a worker restarted mid-generation, ...)
+    gets their plan generated + Day 1 sent now. Concurrency-safe: the plan
+    lock inside generate_and_send_plan stops this racing the payment webhook.
+    """
+    try:
+        phones = await asyncio.to_thread(memory.get_paid_users_without_plan)
+    except Exception as e:
+        logger.error(f"❌ Repair: could not list paid users without plan: {e}", exc_info=True)
+        return
+    for phone_number in phones:
+        logger.warning(f"🛠️ Repair: {phone_number} is paid but has no plan — generating now.")
+        try:
+            await generate_and_send_plan(memory, phone_number)
+        except Exception as e:
+            logger.error(f"❌ Repair failed for {phone_number}: {e}", exc_info=True)
+
+
+_REPAIR_INTERVAL_SECONDS = 120
+
+
 async def _run_forever() -> None:
     """
     Scheduler loop: wakes up once a minute and, once per UTC calendar
@@ -231,6 +249,7 @@ async def _run_forever() -> None:
     everyone sharing one fixed settings.DAILY_CHECKIN_HOUR_UTC.
     """
     last_run_key = None
+    last_repair_at = 0.0
     logger.info(
         "Daily check-in scheduler started - checking every hour for users "
         "whose preferred check-in hour matches."
@@ -244,6 +263,9 @@ async def _run_forever() -> None:
             except Exception as e:
                 logger.error(f"❌ Daily check-in run crashed: {e}", exc_info=True)
             last_run_key = run_key
+        if time.monotonic() - last_repair_at >= _REPAIR_INTERVAL_SECONDS:
+            last_repair_at = time.monotonic()
+            await repair_missing_plans()
         await asyncio.sleep(60)
 
 

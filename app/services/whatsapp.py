@@ -71,6 +71,59 @@ async def send_text_message(to: str, text: str, reply_to: str = None) -> dict:
         raise
 
 
+async def send_reply_buttons(
+    to: str,
+    body: str,
+    buttons: list[tuple[str, str]],
+) -> dict:
+    """
+    Send an interactive "reply buttons" message (max 3 buttons).
+
+    Args:
+        to: Recipient phone number
+        body: Message body (WhatsApp limit: 1024 chars)
+        buttons: list of (button_id, title) — title max 20 chars, id max 256
+
+    Free-form interactive messages are allowed inside the 24h service
+    window, so no template is needed. Button taps arrive on the webhook
+    as type="interactive" (see app/api/main.py).
+    """
+    settings = get_settings()
+
+    headers = {
+        "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body[:1024]},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": bid[:256], "title": title[:20]}}
+                    for bid, title in buttons[:3]
+                ]
+            },
+        },
+    }
+
+    try:
+        url = f"{BASE_URL}/{settings.PHONE_NUMBER_ID}/messages"
+        resp = await _client().post(url, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        logger.info(f"Reply-buttons message sent to {to}: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Failed to send reply-buttons message: {e}", exc_info=True)
+        raise
+
+
 async def send_audio_message(
     to: str,
     audio_bytes: bytes,

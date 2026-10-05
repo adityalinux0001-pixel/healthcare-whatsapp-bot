@@ -54,6 +54,7 @@ from app.services.audio_handler import (
 from app.core.queueing import enqueue_incoming
 from app.services.razorpay_client import create_payment_link, verify_webhook_signature
 from app.services.onboarding import start_onboarding, handle_onboarding_reply, generate_and_send_plan
+from app.services.plan_delivery import send_plan_day, TASK_DONE_PREFIX, TASK_NOT_DONE_PREFIX
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -625,17 +626,17 @@ async def _maybe_send_greeting(phone_number: str) -> bool:
             "workouts, or any health questions you've got.\n\n"
             "Let's quickly get to know you so I can personalize my answers 🙂"
         )
-        await send_text_message(phone_number, welcome_text)
-        await asyncio.to_thread(
-            memory.save_message, phone_number, "assistant", welcome_text, message_type="text"
-        )
 
-        # Immediately start onboarding — this sends the first onboarding
-        # question. Every subsequent user reply is captured by
-        # handle_onboarding_reply() (checked first thing in
+        # ONE message: welcome + first onboarding question (previously
+        # three separate outbound messages). Every subsequent user reply is
+        # captured by handle_onboarding_reply() (checked first thing in
         # _handle_incoming, before any intent classification) until
         # onboarding is complete.
-        await start_onboarding(memory, phone_number, category=settings.DEFAULT_PLAN_CATEGORY)
+        await start_onboarding(
+            memory, phone_number,
+            category=settings.DEFAULT_PLAN_CATEGORY,
+            intro_text=welcome_text,
+        )
 
         logger.info(f"👋 Sent welcome + started onboarding for {phone_number}")
         return True
@@ -771,8 +772,9 @@ async def _send_free_limit_message(
     _handle_incoming, right before generate_context_aware_response is
     called). No LLM call is spent answering the question itself.
 
-    is_first_hit=True is the very first message that crosses the limit
-    (question #FREE_QUESTION_LIMIT + 1) — gets the "you've used up your
+    is_first_hit=True is sent right AFTER the last free answer is
+    delivered (question #FREE_QUESTION_LIMIT; see
+    _handle_free_quota_after_answer) — gets the "you've used up your
     free questions" framing. Every question after that (is_first_hit=
     False) gets a differently-worded repeat so it doesn't read like a
     stuck bot repeating itself, while still always including the app
@@ -879,7 +881,40 @@ async def _send_free_limit_message(
         )
 
 
-async def _flush_pending_checkin_day(phone_number: str, plan_day: dict) -> None:
+async def _handle_free_quota_after_answer(
+    phone_number: str,
+    required_language: str | None = None,
+    link_already_sent: bool = False,
+) -> bool:
+    """
+    Runs right AFTER a real answer was sent. For non-premium users it
+    counts the question against settings.FREE_QUESTION_LIMIT and, ONLY when
+    this answer was the last free one (e.g. question 5 of 5), sends the
+    payment link message.
+
+    Questions 1..LIMIT-1 get NO extra message at all — just the answer
+    (the old per-answer "plan reminder + payment link" and the cross-
+    question follow-up are gone, since Meta bills every outbound message).
+
+    Returns True if the user is in the free phase (non-premium); callers
+    use that to skip the optional follow-up message. Returns False for
+    premium users (nothing counted, nothing sent).
+    """
+    if await asyncio.to_thread(memory.is_premium_active, phone_number):
+        return False
+
+    new_count = await asyncio.to_thread(memory.increment_free_question_count, phone_number)
+    if new_count == settings.FREE_QUESTION_LIMIT and not link_already_sent:
+        try:
+            await _send_free_limit_message(
+                phone_number, is_first_hit=True, required_language=required_language
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to send payment message after last free question for {phone_number}: {e}", exc_info=True)
+    return True
+
+
+async def _flush_pending_checkin_day(phone_number: str, plan_day: dict, prefix: str = "") -> bool:
     """
     Push a premium plan day's REAL content as free-form text, right after
     this user's WhatsApp session window just reopened (they sent
@@ -901,37 +936,77 @@ async def _flush_pending_checkin_day(phone_number: str, plan_day: dict) -> None:
             f"⏭️ Held day {day_number} for {phone_number} is already being sent or was sent; "
             "skipping duplicate delivery."
         )
-        return
+        return False
 
-    header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
-    message = header + plan_day["message_text"]
-    followup_question = plan_day.get("followup_question")
+    return await send_plan_day(memory, phone_number, plan_day, prefix=prefix)
+
+
+async def _send_ack_or_release_next_day(phone_number: str, ack: str) -> None:
+    """
+    After the user confirmed a task (button tap or text reply): if the
+    daily job already HELD the next day because this confirmation was
+    missing, release it NOW with the acknowledgement glued in front of it
+    (one message instead of two); otherwise just send the acknowledgement.
+    """
+    try:
+        if await asyncio.to_thread(memory.is_premium_active, phone_number):
+            pending_day = await asyncio.to_thread(memory.get_pending_template_nudge_day, phone_number)
+            if pending_day:
+                sent = await _flush_pending_checkin_day(
+                    phone_number, pending_day, prefix=f"{ack}\n\n"
+                )
+                if sent:
+                    return
+    except Exception as e:
+        logger.error(f"❌ Failed to release held day for {phone_number}: {e}", exc_info=True)
+
+    await send_text_message(phone_number, ack)
+    await asyncio.to_thread(memory.save_message, phone_number, "assistant", ack, message_type="text")
+
+
+async def _handle_interactive_reply(sender: str, interactive: dict) -> None:
+    """
+    A button tap from the daily "Done / Not done" message
+    (see app/services/plan_delivery.py). Records the status for that plan
+    day — which is what unlocks tomorrow's message — and acknowledges it.
+    The tap is also saved as an inbound message so the 24h service window
+    is correctly tracked from it.
+    """
+    button = (interactive or {}).get("button_reply") or {}
+    button_id = button.get("id") or ""
+    title = button.get("title") or button_id
+
+    if button_id.startswith(TASK_DONE_PREFIX):
+        status, prefix, ack = "done", TASK_DONE_PREFIX, settings.TASK_CONFIRM_DONE_ACK
+    elif button_id.startswith(TASK_NOT_DONE_PREFIX):
+        status, prefix, ack = "not_done", TASK_NOT_DONE_PREFIX, settings.TASK_CONFIRM_NOT_DONE_ACK
+    else:
+        logger.info(f"ℹ️ Ignoring unknown interactive reply from {sender}: {button_id!r}")
+        return
 
     try:
-        await send_text_message(phone_number, message)
-        await asyncio.to_thread(memory.mark_plan_day_sent, phone_number, day_number)
-        await asyncio.to_thread(
-            memory.save_message, phone_number, "assistant", message, message_type="text"
-        )
-        logger.info(
-            f"✅ Flushed held day {day_number} content for {phone_number} "
-            f"now that their session window is open."
-        )
-    except Exception as e:
-        logger.error(f"❌ Failed to flush pending check-in day for {phone_number}: {e}", exc_info=True)
+        day_number = int(button_id[len(prefix):])
+    except ValueError:
+        logger.warning(f"⚠️ Bad task-confirmation button id from {sender}: {button_id!r}")
         return
 
-    if followup_question:
-        try:
-            await send_text_message(phone_number, followup_question)
-            await asyncio.to_thread(
-                memory.save_message, phone_number, "assistant", followup_question, message_type="text"
-            )
-        except Exception as e:
-            logger.error(
-                f"❌ Failed to send follow-up question while flushing day {day_number} "
-                f"for {phone_number}: {e}", exc_info=True,
-            )
+    await asyncio.to_thread(
+        memory.save_message, sender, "user", f"[Button]: {title}", message_type="text"
+    )
+
+    plan_day = await asyncio.to_thread(memory.get_premium_plan_day, sender, day_number)
+    if plan_day and plan_day.get("task_status") is not None:
+        # Already confirmed (double tap / old button) — stay silent, every
+        # outbound message is billed.
+        logger.info(f"⏭️ Day {day_number} already confirmed for {sender} — ignoring repeat tap.")
+        return
+
+    if not await asyncio.to_thread(memory.save_task_confirmation, sender, day_number, status):
+        logger.warning(f"⚠️ Confirmation for unknown/unsent day {day_number} from {sender}.")
+        return
+
+    logger.info(f"✅ {sender} confirmed day {day_number}: {status}")
+    await _send_ack_or_release_next_day(sender, ack)
 
 
 async def maybe_send_followup(
@@ -1098,6 +1173,49 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
 # Configure this URL in the PhonePe Business Dashboard -> Webhooks, and set the
 # same username/password you enter there as PHONEPE_WEBHOOK_USERNAME and
 # PHONEPE_WEBHOOK_PASSWORD in .env.
+_bg_tasks: set = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def _post_payment_flow(phone_number: str) -> None:
+    """Onboarding / plan generation after a successful payment (background)."""
+    try:
+        # Onboarding now normally already ran (for FREE) when this user
+        # first said "hi" (see _maybe_send_greeting), well before they
+        # ever paid. Payment landing is what should trigger the actual
+        # paid plan generation + Day 1 send now — see
+        # app.services.onboarding.generate_and_send_plan().
+        session = await asyncio.to_thread(memory.get_onboarding_session, phone_number)
+        if session and session.get("is_complete"):
+            # Normal case: onboarding already finished, so generate and
+            # send the paid plan right now using those saved answers.
+            await generate_and_send_plan(memory, phone_number, session=session)
+        elif session and not session.get("is_complete"):
+            # User is mid-onboarding when payment landed. Nothing to do
+            # here — _finish_onboarding() checks is_premium_active() the
+            # moment they answer the last question and will generate the
+            # plan itself right then, since the subscription is already
+            # active by that point.
+            logger.info(
+                f"ℹ️ {phone_number} paid mid-onboarding — plan will "
+                f"generate automatically once they finish answering."
+            )
+        else:
+            # Edge case: payment landed without the user ever messaging
+            # the bot first, so onboarding never had a chance to start.
+            # Kick it off now — _finish_onboarding will see this user is
+            # already premium and generate the plan itself once
+            # onboarding finishes.
+            await start_onboarding(memory, phone_number, category=settings.DEFAULT_PLAN_CATEGORY)
+    except Exception as e:
+        logger.error(f"❌ Failed to trigger onboarding/plan generation for {phone_number}: {e}", exc_info=True)
+
+
 @app.post("/razorpay/webhook")
 async def razorpay_webhook(request: Request):
     raw = await request.body()
@@ -1210,9 +1328,9 @@ async def razorpay_webhook(request: Request):
 
     confirm_text = (
         f"Payment received, thank you! 🎉\n\n"
-        f"Your {settings.PREMIUM_PLAN_DAYS}-day Premium plan is now active. "
-        f"You'll get a personalized daily check-in right here in this chat for the next "
-        f"{settings.PREMIUM_PLAN_DAYS} days, along with priority answers in the meantime."
+        f"Your {settings.PREMIUM_PLAN_DAYS}-day Premium plan is now active. ⏳ "
+        f"I'm preparing your personalized plan right now — Day 1 will arrive in this "
+        f"chat in about a minute."
     )
     try:
         await send_text_message(phone_number, confirm_text)
@@ -1226,36 +1344,12 @@ async def razorpay_webhook(request: Request):
         logger.error(f"❌ Failed to send payment confirmation to {phone_number}: {e}", exc_info=True)
 
 
-    try:
-        # Onboarding now normally already ran (for FREE) when this user
-        # first said "hi" (see _maybe_send_greeting), well before they
-        # ever paid. Payment landing is what should trigger the actual
-        # paid plan generation + Day 1 send now — see
-        # app.services.onboarding.generate_and_send_plan().
-        session = await asyncio.to_thread(memory.get_onboarding_session, phone_number)
-        if session and session.get("is_complete"):
-            # Normal case: onboarding already finished, so generate and
-            # send the paid plan right now using those saved answers.
-            await generate_and_send_plan(memory, phone_number, session=session)
-        elif session and not session.get("is_complete"):
-            # User is mid-onboarding when payment landed. Nothing to do
-            # here — _finish_onboarding() checks is_premium_active() the
-            # moment they answer the last question and will generate the
-            # plan itself right then, since the subscription is already
-            # active by that point.
-            logger.info(
-                f"ℹ️ {phone_number} paid mid-onboarding — plan will "
-                f"generate automatically once they finish answering."
-            )
-        else:
-            # Edge case: payment landed without the user ever messaging
-            # the bot first, so onboarding never had a chance to start.
-            # Kick it off now — _finish_onboarding will see this user is
-            # already premium and generate the plan itself once
-            # onboarding finishes.
-            await start_onboarding(memory, phone_number, category=settings.DEFAULT_PLAN_CATEGORY)
-    except Exception as e:
-        logger.error(f"❌ Failed to trigger onboarding/plan generation for {phone_number}: {e}", exc_info=True)
+    # Plan generation (one big Gemini call, often 30-120s) must NOT run
+    # inside the webhook request: Razorpay times out and retries, and a
+    # worker restart mid-request would silently lose the plan. Run it in the
+    # background and answer Razorpay immediately; the repair job in
+    # daily_checkin.py retries if this ever fails.
+    _spawn_background(_post_payment_flow(phone_number))
 
     return {"status": "ok"}
 
@@ -1434,10 +1528,7 @@ async def _handle_incoming(raw_msg: dict) -> None:
                     f"'{user_text[:80]}'"
                 )
                 ack = "Thanks for the update! 👍 Keep it up, and I'll check in again tomorrow."
-                await send_text_message(sender, ack)
-                await asyncio.to_thread(
-                    memory.save_message, sender, "assistant", ack, message_type="text"
-                )
+                await _send_ack_or_release_next_day(sender, ack)
                 return
         except Exception as e:
             logger.error(f"❌ Follow-up capture failed for {sender}: {e}", exc_info=True)
@@ -1522,7 +1613,7 @@ Type /stats to see your conversation statistics.
                     gate_required_language = None
                 await _send_free_limit_message(
                     sender,
-                    is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
+                    is_first_hit=False,
                     required_language=gate_required_language,
                 )
                 return
@@ -1555,20 +1646,15 @@ Type /stats to see your conversation statistics.
         except Exception as e:
             logger.error(f"❌ Failed to send reply: {e}", exc_info=True)
 
-        if not await asyncio.to_thread(memory.is_premium_active, sender):
-            # This question just got a real answer — count it against the
-            # free-question quota (see the gate above generate_context_
-            # aware_response). Only reached when generate_context_aware_
-            # response actually succeeded, so a Gemini failure never
-            # burns a free question.
-            await asyncio.to_thread(memory.increment_free_question_count, sender)
-            if not premium_link_already_sent_this_turn:
-                # Avoid sending a SECOND payment-link message in the same
-                # turn — the premium_related branch above may have already
-                # sent one (offer or expiry notice).
-                background_tasks.append(asyncio.create_task(
-                    _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
-                ))
+        # Free-question accounting: nothing extra is sent for questions
+        # 1..LIMIT-1; the payment link goes out right after the LIMIT-th
+        # answer. premium_link_already_sent_this_turn avoids a duplicate if
+        # the user explicitly asked for the plan in this same message.
+        in_free_phase = await _handle_free_quota_after_answer(
+            sender,
+            required_language=required_language,
+            link_already_sent=premium_link_already_sent_this_turn,
+        )
 
         # Update summary in background
         customer_data = await asyncio.to_thread(memory.get_customer, sender)
@@ -1584,19 +1670,21 @@ Type /stats to see your conversation statistics.
         # Cross-question the user with a precise, context-grounded
         # follow-up (or suggestion of what to ask next) — fire-and-forget
         # so it never delays the primary reply.
-        context_for_followup = await asyncio.to_thread(
-            memory.get_conversation_context, sender, limit=5
-        )
-        background_tasks.append(asyncio.create_task(
-            maybe_send_followup(
-                sender,
-                customer_data.get("summary", ""),
-                context_for_followup,
-                user_text,
-                reply,
-                required_language=required_language,
+        # (skipped during the free phase: it's one more billed message)
+        if not in_free_phase:
+            context_for_followup = await asyncio.to_thread(
+                memory.get_conversation_context, sender, limit=5
             )
-        ))
+            background_tasks.append(asyncio.create_task(
+                maybe_send_followup(
+                    sender,
+                    customer_data.get("summary", ""),
+                    context_for_followup,
+                    user_text,
+                    reply,
+                    required_language=required_language,
+                )
+            ))
 
     # ============ AUDIO MESSAGE ============
     elif msg.type == "audio" and msg.audio:
@@ -1656,7 +1744,7 @@ Type /stats to see your conversation statistics.
                             gate_required_language = None
                     await _send_free_limit_message(
                         sender,
-                        is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
+                        is_first_hit=False,
                         required_language=gate_required_language,
                     )
                     return
@@ -1691,11 +1779,9 @@ Type /stats to see your conversation statistics.
             await send_text_message(sender, reply)
             logger.info(f"🤖 → [{sender}]: {reply[:100]}...")
 
-            if not await asyncio.to_thread(memory.is_premium_active, sender):
-                await asyncio.to_thread(memory.increment_free_question_count, sender)
-                background_tasks.append(asyncio.create_task(
-                    _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
-                ))
+            in_free_phase = await _handle_free_quota_after_answer(
+                sender, required_language=required_language
+            )
             
             # Update summary in background
             customer_data = await asyncio.to_thread(memory.get_customer, sender)
@@ -1708,21 +1794,23 @@ Type /stats to see your conversation statistics.
                 )
             ))
 
-            # Cross-question the user based on this exchange.
-            context_for_followup = await asyncio.to_thread(
-                memory.get_conversation_context, sender, limit=5
-            )
-            background_tasks.append(asyncio.create_task(
-                maybe_send_followup(
-                    sender,
-                    customer_data.get("summary", ""),
-                    context_for_followup,
-                    f"[Voice Message]: {transcription}",
-                    reply,
-                    whisper_language=whisper_language,
-                    required_language=required_language,
+            # Cross-question the user based on this exchange (skipped in
+            # the free phase — one more billed message).
+            if not in_free_phase:
+                context_for_followup = await asyncio.to_thread(
+                    memory.get_conversation_context, sender, limit=5
                 )
-            ))
+                background_tasks.append(asyncio.create_task(
+                    maybe_send_followup(
+                        sender,
+                        customer_data.get("summary", ""),
+                        context_for_followup,
+                        f"[Voice Message]: {transcription}",
+                        reply,
+                        whisper_language=whisper_language,
+                        required_language=required_language,
+                    )
+                ))
 
             # Clean up old audio files
             background_tasks.append(asyncio.create_task(asyncio.to_thread(memory.delete_old_audio_files, sender, keep_count=10)))
@@ -1761,7 +1849,7 @@ Type /stats to see your conversation statistics.
                             gate_required_language = None
                         await _send_free_limit_message(
                             sender,
-                            is_first_hit=(free_count == settings.FREE_QUESTION_LIMIT),
+                            is_first_hit=False,
                             required_language=gate_required_language,
                         )
                         return
@@ -1788,11 +1876,9 @@ Type /stats to see your conversation statistics.
             await send_text_message(sender, reply)
             logger.info(f"🤖 → [{sender}]: {reply[:100]}...")
 
-            if not await asyncio.to_thread(memory.is_premium_active, sender):
-                await asyncio.to_thread(memory.increment_free_question_count, sender)
-                background_tasks.append(asyncio.create_task(
-                    _maybe_send_unpaid_plan_reminder(sender, required_language=required_language)
-                ))
+            in_free_phase = await _handle_free_quota_after_answer(
+                sender, required_language=required_language
+            )
             
             # Update summary in background
             customer_data = await asyncio.to_thread(memory.get_customer, sender)
@@ -1805,24 +1891,33 @@ Type /stats to see your conversation statistics.
                 )
             ))
 
-            # Cross-question the user based on this exchange.
-            context_for_followup = await asyncio.to_thread(
-                memory.get_conversation_context, sender, limit=5
-            )
-            background_tasks.append(asyncio.create_task(
-                maybe_send_followup(
-                    sender,
-                    customer_data.get("summary", ""),
-                    context_for_followup,
-                    f"[Sent an Image]: {image_description}",
-                    reply,
-                    required_language=required_language,
+            # Cross-question the user based on this exchange (skipped in
+            # the free phase — one more billed message).
+            if not in_free_phase:
+                context_for_followup = await asyncio.to_thread(
+                    memory.get_conversation_context, sender, limit=5
                 )
-            ))
+                background_tasks.append(asyncio.create_task(
+                    maybe_send_followup(
+                        sender,
+                        customer_data.get("summary", ""),
+                        context_for_followup,
+                        f"[Sent an Image]: {image_description}",
+                        reply,
+                        required_language=required_language,
+                    )
+                ))
 
         except Exception as e:
             logger.error(f"❌ Image processing error: {e}", exc_info=True)
             await send_text_message(sender, "Sorry, I couldn't process the image. Please try again or send text instead.")
+
+    # ============ BUTTON TAP (daily task confirmation) ============
+    elif msg.type == "interactive" and msg.interactive:
+        try:
+            await _handle_interactive_reply(sender, msg.interactive)
+        except Exception as e:
+            logger.error(f"❌ Interactive reply handling failed for {sender}: {e}", exc_info=True)
 
     else:
         await send_text_message(sender, "I can handle text, audio, and images. Please send one of those formats.")

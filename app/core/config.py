@@ -112,6 +112,19 @@ class Settings(BaseSettings):
     # renews Premium (see ConversationMemory.activate_subscription).
     FREE_QUESTION_LIMIT: int = 5
 
+    # Daily task confirmation (WhatsApp reply buttons).
+    # Every daily plan message is followed by a "Done / Not done" button
+    # message. The user's tap re-opens the 24h service window AND is the
+    # gate for tomorrow's plan: no confirmation -> next day is NOT sent.
+    TASK_CONFIRM_NOTE: str = (
+        "⚠️ Note: please confirm whether you completed today's task or not, "
+        "otherwise tomorrow's task will not be sent."
+    )
+    TASK_CONFIRM_DONE_LABEL: str = "✅ Task done"      # max 20 chars (Meta limit)
+    TASK_CONFIRM_NOT_DONE_LABEL: str = "❌ Not done"   # max 20 chars (Meta limit)
+    TASK_CONFIRM_DONE_ACK: str = "Great job! 🎉 Tomorrow's task will arrive at your chosen time."
+    TASK_CONFIRM_NOT_DONE_ACK: str = "No worries 🙂 Try again — tomorrow's task will arrive at your chosen time."
+
     # Logging
     LOG_LEVEL: str = "INFO"
 

@@ -46,6 +46,7 @@ from three places:
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 
 from app.core.config import get_settings
@@ -56,7 +57,8 @@ from app.services.llm import (
     classify_onboarding_answer,
     GeminiUnavailableError,
 )
-from app.services.whatsapp import send_text_message
+from app.services.whatsapp import send_text_message, send_template_message
+from app.services.plan_delivery import send_plan_day
 
 logger = logging.getLogger(__name__)
 
@@ -337,32 +339,37 @@ async def start_onboarding(
     memory: ConversationMemory,
     phone_number: str,
     category: Optional[str] = None,
+    intro_text: Optional[str] = None,
 ) -> None:
     """
-    Kick off onboarding for a freshly-subscribed user: creates/resets the
-    onboarding session at question 0 and sends the first question. Call
-    this right after memory.activate_subscription(...) succeeds (see the
-    /razorpay/webhook handler in app/main.py).
+    Create/reset the onboarding session at question 0 and send the first
+    question.
+
+    Sends ONE WhatsApp message (intro + question 1) instead of two/three,
+    because Meta bills every outbound service message. `intro_text` lets
+    the caller supply its own opener (e.g. the first-"hi" welcome in
+    app/api/main.py::_maybe_send_greeting) so that opener is merged into
+    this same message instead of being sent separately. If omitted, the
+    default "you're all set" intro (used when onboarding is kicked off by
+    a payment) is used.
     """
     category = category or settings.DEFAULT_PLAN_CATEGORY
     questions = _questions_for(category)
 
     await asyncio.to_thread(memory.start_onboarding_session, phone_number, category)
 
-    intro = (
-        f"🎉 You're all set on the {category.replace('_', ' ')} plan!\n\n"
-        f"Just {len(questions)} quick questions so I can personalize your "
-        f"{settings.PREMIUM_PLAN_DAYS}-day plan, then I'll get it ready for you."
-    )
-    await send_text_message(phone_number, intro)
-    await asyncio.to_thread(
-        memory.save_message, phone_number, "assistant", intro, message_type="text"
-    )
+    if intro_text is None:
+        intro_text = (
+            f"🎉 You're all set on the {category.replace('_', ' ')} plan!\n\n"
+            f"Just {len(questions)} quick questions so I can personalize your "
+            f"{settings.PREMIUM_PLAN_DAYS}-day plan, then I'll get it ready for you."
+        )
 
     first_key, first_prompt = questions[0]
-    await send_text_message(phone_number, first_prompt)
+    first_message = f"{intro_text}\n\n{first_prompt}"
+    await send_text_message(phone_number, first_message)
     await asyncio.to_thread(
-        memory.save_message, phone_number, "assistant", first_prompt, message_type="text"
+        memory.save_message, phone_number, "assistant", first_message, message_type="text"
     )
 
 
@@ -418,95 +425,121 @@ async def _finish_onboarding(
     )
 
 
+_PLAN_LOCK_TTL_SECONDS = 600
+_PLAN_GEN_ATTEMPTS = 3
+_PLAN_GEN_RETRY_DELAYS = (5, 20)  # seconds between attempts
+
+
+async def _acquire_plan_lock(phone_number: str) -> bool:
+    """Cross-process lock so the payment webhook and the repair job never
+    generate the same user's plan twice. Fails OPEN if Redis is down."""
+    try:
+        from app.core.redis_client import get_redis
+        return bool(await get_redis().set(
+            f"plan_gen_lock:{phone_number}", "1", nx=True, ex=_PLAN_LOCK_TTL_SECONDS
+        ))
+    except Exception as e:
+        logger.warning(f"⚠️ Plan lock unavailable ({e}) — continuing without it.")
+        return True
+
+
+async def _release_plan_lock(phone_number: str) -> None:
+    try:
+        from app.core.redis_client import get_redis
+        await get_redis().delete(f"plan_gen_lock:{phone_number}")
+    except Exception:
+        pass
+
+
 async def generate_and_send_plan(
     memory: ConversationMemory, phone_number: str, session: Optional[dict] = None
-) -> None:
+) -> bool:
     """
     Generate the full {PREMIUM_PLAN_DAYS}-day plan from this user's
     already-saved onboarding answers (one LLM call), save it, and send
     Day 1 immediately. Requires onboarding to already be complete.
 
-    Call this from exactly two places:
-      1. _finish_onboarding() above, if the user is ALREADY premium the
-         moment onboarding finishes.
-      2. The /razorpay/webhook handler in app/main.py, once payment
-         lands — the normal case now, since onboarding usually finishes
-         well before payment.
+    Call from:
+      1. _finish_onboarding() — user is ALREADY premium when onboarding ends.
+      2. The payment webhook (app/api/main.py) — runs as a BACKGROUND task
+         there, so the slow Gemini call never blocks the webhook response.
+      3. run_daily_checkins' repair step (app/services/daily_checkin.py) —
+         safety net for paid users whose plan never got generated.
 
-    `session` (the dict returned by mark_onboarding_complete /
-    get_onboarding_session — needs "answers" and "category") can be
-    passed in to avoid a redundant DB round-trip; if omitted, it's
-    fetched here instead.
-
-    If plan generation fails, the user is told to hang tight and nothing
-    partial is saved — safe to retry by calling this again.
+    Robustness (paid users must never be left without Day 1):
+      - cross-process lock: no double generation / double Day 1
+      - skips generation if a plan for the current subscription exists
+      - retries Gemini failures (3 attempts); if all fail, the repair job
+        retries every few minutes until it works
+    Returns True if the plan exists afterwards (Day 1 sent or held).
     """
-    if session is None:
-        session = await asyncio.to_thread(memory.get_onboarding_session, phone_number)
-    answers = (session or {}).get("answers", {}) or {}
-    category = (session or {}).get("category") or settings.DEFAULT_PLAN_CATEGORY
-
-    await send_text_message(
-        phone_number,
-        "Perfect, thank you! 🙏 Give me a moment while I put together your "
-        f"full {settings.PREMIUM_PLAN_DAYS}-day plan...",
-    )
-
-    context_text = await asyncio.to_thread(memory.get_conversation_context, phone_number, limit=5)
-    required_language = None
-    if context_text:
-        required_language = await detect_reply_language(context_text[-500:])
+    if not await _acquire_plan_lock(phone_number):
+        logger.info(f"⏭️ Plan generation for {phone_number} already in progress elsewhere — skipping.")
+        return False
 
     try:
-        days = await generate_premium_plan(
-            onboarding_answers=answers,
-            category=category,
-            total_days=settings.PREMIUM_PLAN_DAYS,
-            required_language=required_language,
-        )
-    except GeminiUnavailableError:
-        logger.warning(f"⏭️ Plan generation unavailable for {phone_number} — will need a retry.")
-        await send_text_message(
-            phone_number,
-            "I'm having trouble generating your plan right now due to high demand. "
-            "Please message me again in a few minutes and I'll pick up right where we left off 🙏",
-        )
-        return
-    except ValueError as e:
-        logger.error(f"❌ Plan generation malformed for {phone_number}: {e}", exc_info=True)
-        await send_text_message(
-            phone_number,
-            "Something went wrong while building your plan. Our team has been notified — "
-            "please message me again shortly and I'll retry.",
-        )
-        return
+        if await asyncio.to_thread(memory.has_current_plan, phone_number):
+            logger.info(f"⏭️ {phone_number} already has a plan for the current subscription — skipping.")
+            return True
 
-    await asyncio.to_thread(memory.save_premium_plan, phone_number, category, days)
+        if session is None:
+            session = await asyncio.to_thread(memory.get_onboarding_session, phone_number)
+        answers = (session or {}).get("answers", {}) or {}
+        category = (session or {}).get("category") or settings.DEFAULT_PLAN_CATEGORY
 
-    confirm = (
-        f"✅ Your personalized {settings.PREMIUM_PLAN_DAYS}-day plan is ready!\n\n"
-        f"Day 1 is coming up right now 👇 and then one message per day, every day "
-        f"around your chosen time. I'll also check in with a quick question after "
-        f"each one — just reply whenever you can 💪"
-    )
-    await send_text_message(phone_number, confirm)
-    await asyncio.to_thread(
-        memory.save_message, phone_number, "assistant", confirm, message_type="text"
-    )
+        context_text = await asyncio.to_thread(memory.get_conversation_context, phone_number, limit=5)
+        required_language = None
+        if context_text:
+            try:
+                required_language = await detect_reply_language(context_text[-500:])
+            except Exception as e:
+                logger.warning(f"⚠️ Language detection failed for {phone_number}: {e}")
 
-    await _send_plan_day_now(memory, phone_number, day_number=1)
+        days = None
+        for attempt in range(1, _PLAN_GEN_ATTEMPTS + 1):
+            try:
+                days = await generate_premium_plan(
+                    onboarding_answers=answers,
+                    category=category,
+                    total_days=settings.PREMIUM_PLAN_DAYS,
+                    required_language=required_language,
+                )
+                break
+            except (GeminiUnavailableError, ValueError) as e:
+                logger.warning(
+                    f"⚠️ Plan generation attempt {attempt}/{_PLAN_GEN_ATTEMPTS} failed "
+                    f"for {phone_number}: {e}"
+                )
+                if attempt < _PLAN_GEN_ATTEMPTS:
+                    await asyncio.sleep(_PLAN_GEN_RETRY_DELAYS[attempt - 1])
+
+        if days is None:
+            logger.error(f"❌ Plan generation failed for {phone_number} — repair job will retry.")
+            return False
+
+        await asyncio.to_thread(memory.save_premium_plan, phone_number, category, days)
+
+        confirm = (
+            f"✅ Your personalized {settings.PREMIUM_PLAN_DAYS}-day plan is ready!\n"
+            f"Here's Day 1 👇 — then one task per day around your chosen time. "
+            f"Tap a button after each task so I know how it went 💪\n\n"
+        )
+        # Plan-ready note + Day 1 + confirm buttons go out together (1-2
+        # messages total instead of 4).
+        await _send_plan_day_now(memory, phone_number, day_number=1, prefix=confirm)
+        return True
+    finally:
+        await _release_plan_lock(phone_number)
 
 
 async def _send_plan_day_now(
-    memory: ConversationMemory, phone_number: str, day_number: int
+    memory: ConversationMemory, phone_number: str, day_number: int, prefix: str = ""
 ) -> None:
     """
-    Fetch a specific pregenerated plan day and send it right now, with a
-    clear "Day X of N" header prepended so it's unambiguous in the chat
-    which message is the daily plan content (as opposed to onboarding
-    confirmations, follow-up questions, etc.). Marks the row as sent and
-    opens the same-day follow-up window, exactly like the scheduled job
-    in app/daily_checkin.py does - this is just that same send-path,
+    Fetch a specific pregenerated plan day and send it right now (with the
+    "Day X of N" header and the Done / Not-done confirmation buttons — see
+    app/services/plan_delivery.py), exactly like the scheduled job in
+    app/services/daily_checkin.py does; this is just that same send-path
     triggered immediately instead of on the next scheduler tick.
     """
     plan_day = await asyncio.to_thread(memory.get_premium_plan_day, phone_number, day_number)
@@ -514,6 +547,35 @@ async def _send_plan_day_now(
         logger.error(
             f"❌ Tried to immediately send day {day_number} for {phone_number} but "
             "no such pregenerated row exists — skipping."
+        )
+        return
+
+    # WhatsApp only delivers free-form messages within 24h of the user's
+    # last inbound message. If they paid later than that, free-form Day 1
+    # would show "sent" but never arrive — so HOLD it instead: it is
+    # pushed the moment the user sends any message (main.py ->
+    # _flush_pending_checkin_day), or at their check-in hour if open by then.
+    last_inbound_at = await asyncio.to_thread(memory.get_last_inbound_message_at, phone_number)
+    window_open = False
+    if last_inbound_at is not None:
+        if last_inbound_at.tzinfo is not None:
+            last_inbound_at = last_inbound_at.replace(tzinfo=None)
+        window_open = (datetime.utcnow() - last_inbound_at) < timedelta(
+            hours=settings.WHATSAPP_SESSION_WINDOW_HOURS
+        )
+    if not window_open:
+        await asyncio.to_thread(memory.mark_plan_day_template_nudge_sent, phone_number, day_number)
+        if settings.DAILY_CHECKIN_REENGAGEMENT_TEMPLATE:
+            try:
+                await send_template_message(
+                    phone_number, settings.DAILY_CHECKIN_REENGAGEMENT_TEMPLATE,
+                    params=[str(day_number)],
+                )
+            except Exception as e:
+                logger.error(f"❌ Re-engagement template failed for {phone_number}: {e}", exc_info=True)
+        logger.info(
+            f"⏸️ Day {day_number} for {phone_number} held — 24h window closed; "
+            "will send as soon as they message."
         )
         return
 
@@ -527,22 +589,7 @@ async def _send_plan_day_now(
         )
         return
 
-    header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
-    message = header + plan_day["message_text"]
-    followup_question = plan_day.get("followup_question")
-
-    await send_text_message(phone_number, message)
-    await asyncio.to_thread(memory.mark_plan_day_sent, phone_number, day_number)
-    await asyncio.to_thread(
-        memory.save_message, phone_number, "assistant", message, message_type="text"
-    )
-    logger.info(f"✅ Sent day {day_number}/{settings.PREMIUM_PLAN_DAYS} immediately to {phone_number}")
-
-    if followup_question:
-        await send_text_message(phone_number, followup_question)
-        await asyncio.to_thread(
-            memory.save_message, phone_number, "assistant", followup_question, message_type="text"
-        )
+    await send_plan_day(memory, phone_number, plan_day, prefix=prefix)
 
 
 async def handle_onboarding_reply(
