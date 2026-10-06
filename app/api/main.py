@@ -55,6 +55,8 @@ from app.core.queueing import enqueue_incoming
 from app.services.razorpay_client import create_payment_link, verify_webhook_signature
 from app.services.onboarding import start_onboarding, handle_onboarding_reply, generate_and_send_plan
 from app.services.plan_delivery import send_plan_day, TASK_DONE_PREFIX, TASK_NOT_DONE_PREFIX
+from app.services import daily_limit
+from contextvars import ContextVar
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -1386,7 +1388,76 @@ async def phonepe_redirect():
 </html>"""
 
 
+# Per-message scratchpad shared between _handle_incoming (wrapper) and
+# _handle_incoming_core: lets the core flag "this was the user's last
+# allowed message today" so the wrapper sends the limit reminder AFTER the
+# answer has been delivered.
+_limit_state: ContextVar[dict | None] = ContextVar("daily_limit_state", default=None)
+
+
+def _limit_reached_now() -> bool:
+    state = _limit_state.get()
+    return bool(state and state.get("remind"))
+
+
+async def _daily_limit_blocks(sender: str, exempt_followup: bool = False) -> bool:
+    """
+    True -> the user is over today's limit: the caller must drop the message
+    silently (no reply, no cost). Applies to PAID (premium) users only.
+    Only real chat messages are counted; button
+    taps, onboarding answers and replies to the daily follow-up question are
+    never routed through here (they unlock tomorrow's plan, so they must
+    always work).
+    """
+    try:
+        # The daily limit only starts AFTER payment. Unpaid users are
+        # already capped by settings.FREE_QUESTION_LIMIT (5 free questions
+        # total), so they are neither counted nor blocked here.
+        if not await asyncio.to_thread(memory.is_premium_active, sender):
+            return False
+        if exempt_followup and await asyncio.to_thread(memory.get_awaiting_followup_day, sender):
+            return False
+        status = await daily_limit.register_message(sender)
+    except Exception as e:
+        logger.error(f"❌ Daily-limit check crashed for {sender} (allowing): {e}", exc_info=True)
+        return False
+
+    if status == daily_limit.BLOCKED:
+        logger.info(f"🚫 {sender} is over the daily message limit — message ignored.")
+        return True
+    if status == daily_limit.REACHED:
+        state = _limit_state.get()
+        if state is not None:
+            state["remind"] = True
+            state["sender"] = sender
+    return False
+
+
 async def _handle_incoming(raw_msg: dict) -> None:
+    """Entry point used by the queue workers: runs the normal message
+    handling, then — if that message was the user's last allowed one today —
+    sends the single "daily limit reached, resets tomorrow" reminder."""
+    state = {"remind": False, "sender": None}
+    token = _limit_state.set(state)
+    try:
+        await _handle_incoming_core(raw_msg)
+    finally:
+        _limit_state.reset(token)
+
+    if state["remind"] and state["sender"]:
+        try:
+            limit = await daily_limit.get_limit()
+            text = daily_limit.reached_message(limit)
+            await send_text_message(state["sender"], text)
+            await asyncio.to_thread(
+                memory.save_message, state["sender"], "assistant", text, message_type="text"
+            )
+            logger.info(f"⚠️ Daily limit ({limit}) reached for {state['sender']} — reminder sent.")
+        except Exception as e:
+            logger.error(f"❌ Failed to send daily-limit reminder: {e}", exc_info=True)
+
+
+async def _handle_incoming_core(raw_msg: dict) -> None:
     """Enhanced message handler with context awareness and audio support.
 
     Runs as a detached background task (scheduled from the webhook handler),
@@ -1461,6 +1532,11 @@ async def _handle_incoming(raw_msg: dict) -> None:
                 return
         except Exception as e:
             logger.error(f"❌ Onboarding reply handling failed for {sender}: {e}", exc_info=True)
+
+        # Daily chat limit (onboarding answers above are exempt; so are
+        # replies to the daily follow-up question).
+        if await _daily_limit_blocks(sender, exempt_followup=True):
+            return
 
         # Tracks whether a payment-link message already went out earlier
         # in THIS turn (e.g. the premium-offer branch below), so we can
@@ -1671,7 +1747,7 @@ Type /stats to see your conversation statistics.
         # follow-up (or suggestion of what to ask next) — fire-and-forget
         # so it never delays the primary reply.
         # (skipped during the free phase: it's one more billed message)
-        if not in_free_phase:
+        if not in_free_phase and not _limit_reached_now():
             context_for_followup = await asyncio.to_thread(
                 memory.get_conversation_context, sender, limit=5
             )
@@ -1689,6 +1765,9 @@ Type /stats to see your conversation statistics.
     # ============ AUDIO MESSAGE ============
     elif msg.type == "audio" and msg.audio:
         logger.info(f"🎤 [{sender}] Audio received | ID: {msg.audio.id}")
+
+        if await _daily_limit_blocks(sender):
+            return
         
         try:
             media_bytes, mime_type = await download_media(msg.audio.id)
@@ -1796,7 +1875,7 @@ Type /stats to see your conversation statistics.
 
             # Cross-question the user based on this exchange (skipped in
             # the free phase — one more billed message).
-            if not in_free_phase:
+            if not in_free_phase and not _limit_reached_now():
                 context_for_followup = await asyncio.to_thread(
                     memory.get_conversation_context, sender, limit=5
                 )
@@ -1822,6 +1901,9 @@ Type /stats to see your conversation statistics.
     # ============ IMAGE MESSAGE ============
     elif msg.type == "image" and msg.image:
         logger.info(f"📸 [{sender}] Image received | ID: {msg.image.id}")
+
+        if await _daily_limit_blocks(sender):
+            return
         
         try:
             media_bytes, mime_type = await download_media(msg.image.id)
@@ -1893,7 +1975,7 @@ Type /stats to see your conversation statistics.
 
             # Cross-question the user based on this exchange (skipped in
             # the free phase — one more billed message).
-            if not in_free_phase:
+            if not in_free_phase and not _limit_reached_now():
                 context_for_followup = await asyncio.to_thread(
                     memory.get_conversation_context, sender, limit=5
                 )

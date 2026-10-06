@@ -112,6 +112,24 @@ class Settings(BaseSettings):
     # renews Premium (see ConversationMemory.activate_subscription).
     FREE_QUESTION_LIMIT: int = 5
 
+    # Per-user daily chat limit (Meta bills every outbound service message).
+    # Applies to PAID (premium) users only — it starts counting after payment.
+    # Before payment the FREE_QUESTION_LIMIT (5 questions total) applies instead.
+    # Each paid user may send DAILY_MESSAGE_LIMIT chat messages per day; after the
+    # last allowed one they get a single reminder, further messages that day
+    # are ignored silently (no reply = no cost), and the counter resets at
+    # local midnight. 0 = unlimited.
+    # Can be changed WITHOUT redeploy / restart, e.g. to test with 5:
+    #   docker compose exec redis redis-cli set config:daily_message_limit 5
+    #   docker compose exec redis redis-cli del config:daily_message_limit   (back to .env value)
+    DAILY_MESSAGE_LIMIT: int = 25
+    # Day boundary for the reset. 330 = India (IST, UTC+5:30).
+    DAILY_LIMIT_UTC_OFFSET_MINUTES: int = 330
+    DAILY_LIMIT_REACHED_MESSAGE: str = (
+        "⚠️ You've reached today's limit of {limit} messages.\n"
+        "Your limit resets tomorrow 🌅 — you can chat with me again then. Thank you for understanding 🙏"
+    )
+
     # Daily task confirmation (WhatsApp reply buttons).
     # Every daily plan message is followed by a "Done / Not done" button
     # message. The user's tap re-opens the 24h service window AND is the
