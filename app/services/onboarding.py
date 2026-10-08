@@ -413,6 +413,14 @@ async def _finish_onboarding(
         await generate_and_send_plan(memory, phone_number, session=session)
         return
 
+    if settings.FREE_QUESTION_LIMIT <= 0:
+        # No free questions: the payment offer goes out right now, as the
+        # ONE message that closes onboarding (instead of the "ask me
+        # anything" outro). Imported lazily to avoid a circular import.
+        from app.api.main import _send_free_limit_message
+        await _send_free_limit_message(phone_number, is_first_hit=True)
+        return
+
     outro = (
         "Perfect, thank you! 🙏 I've got everything I need to personalize "
         "my answers for you.\n\n"

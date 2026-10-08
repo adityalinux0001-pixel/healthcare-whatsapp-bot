@@ -110,7 +110,9 @@ class Settings(BaseSettings):
     # before every further question gets the payment link + app features
     # instead of an actual answer. Resets to 0 whenever the user buys/
     # renews Premium (see ConversationMemory.activate_subscription).
-    FREE_QUESTION_LIMIT: int = 5
+    # Free questions before payment. 0 = no free questions: the payment offer
+    # is sent right after onboarding and every question is gated until paid.
+    FREE_QUESTION_LIMIT: int = 0
 
     # Per-user daily chat limit (Meta bills every outbound service message).
     # Applies to PAID (premium) users only — it starts counting after payment.

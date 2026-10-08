@@ -834,7 +834,19 @@ async def _send_free_limit_message(
         else "Reply here and we'll get a payment link sent to you to keep going."
     )
 
-    if is_first_hit:
+    if is_first_hit and settings.FREE_QUESTION_LIMIT <= 0:
+        # No free questions at all: this is the message right after
+        # onboarding finishes (see onboarding._finish_onboarding).
+        text = (
+            f"Perfect, thank you! 🙏 I've got everything I need to personalize your plan.\n\n"
+            f"To get started, grab our {settings.PREMIUM_PLAN_DAYS}-Day "
+            f"{copy['plan_name']} for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES} — you get:\n"
+            f"1. A daily action plan for {settings.PREMIUM_PLAN_DAYS} days — {copy['daily_item']}\n"
+            f"2. Priority, more detailed answers whenever you're stuck or plateauing\n"
+            f"3. {copy['adapt_line']}\n\n"
+            f"{link_line}"
+        )
+    elif is_first_hit:
         text = (
             f"You've used up your {settings.FREE_QUESTION_LIMIT} free questions "
             f"for now. 🙌\n\n"
@@ -848,7 +860,7 @@ async def _send_free_limit_message(
     else:
         text = (
             f"Still here whenever you're ready 🙂\n\n"
-            f"Premium unlocks unlimited questions, a personalized "
+            f"Premium unlocks full access, a personalized "
             f"{settings.PREMIUM_PLAN_DAYS}-day plan with daily check-ins, and "
             f"priority answers — all for ₹{settings.PREMIUM_PLAN_AMOUNT_RUPEES}.\n\n"
             f"{link_line}"
