@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     PREMIUM_PLAN_DAYS: int = 21
 
     DAILY_CHECKIN_ENABLED: bool = True
-    DAILY_CHECKIN_HOUR_UTC: int = 9
+    DAILY_CHECKIN_HOUR_UTC: int = 3
     DAILY_CHECKIN_MIN_GAP_HOURS: int = 20
 
     # WhatsApp only allows free-form text within 24h of the user's last
@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     WHATSAPP_SESSION_WINDOW_HOURS: float = 23.0
 
     DEFAULT_PLAN_CATEGORY: str = "weight_loss"
-    PLAN_GENERATION_MAX_OUTPUT_TOKENS: int = 14000
+    PLAN_GENERATION_MAX_OUTPUT_TOKENS: int = 16000  # per 7-day chunk (plan is generated in chunks)
 
     SYMPTOM_INTAKE_MAX_QUESTIONS: int = 4
     SYMPTOM_INTAKE_SESSION_TIMEOUT_SECONDS: int = 60 * 60

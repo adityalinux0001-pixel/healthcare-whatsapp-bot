@@ -11,9 +11,11 @@ Flow:
         -> Category selection (default: weight_loss; more categories added
            later purely as new entries in QUESTIONS_BY_CATEGORY / app.llm's
            PLAN_CATEGORY_PROMPTS — nothing else changes)
-        -> Onboarding questions (7 profile questions + 1 "what time should
-           I check in daily?" question, one at a time via WhatsApp) — FREE,
-           no payment required
+        -> Onboarding questions (8 profile questions: age & gender, height &
+           weight, city, target weight, sugar intake, exercise, family
+           history, dairy — one at a time via WhatsApp) — FREE, no payment
+           required. The daily check-in hour is no longer asked; it uses
+           settings.DAILY_CHECKIN_HOUR_UTC.
         -> Onboarding complete (_finish_onboarding): answers + preferred
            check-in hour are saved. If the user isn't premium yet (the
            normal case), they're invited to ask questions now — up to
@@ -46,7 +48,7 @@ from three places:
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.config import get_settings
@@ -69,43 +71,71 @@ settings = get_settings()
 QUESTIONS_BY_CATEGORY: dict[str, list[tuple[str, str]]] = {
     "weight_loss": [
         (
-            "weight_height",
+            "age_gender",
             "Let's build your personalized plan! 📋\n\n"
-            "1️⃣ What's your current weight and height? (e.g. \"72kg, 165cm\")",
+            "1️⃣ How old are you, and what is your gender?\n\n"
+            "Age: ___\n"
+            "Gender: Male / Female / Prefer not to say\n\n"
+            "(e.g. \"28, Female\")",
         ),
         (
-            "goal",
-            "2️⃣ What's your goal? (e.g. \"lose 5kg\", \"fit into old jeans\", \"just feel healthier\")",
+            "height_weight",
+            "2️⃣ What are your current height and weight?\n\n"
+            "Height: ___ cm / ft & inches\n"
+            "Weight: ___ kg / lbs\n\n"
+            "(e.g. \"165 cm, 72 kg\" or \"5 ft 6 in, 158 lbs\")",
         ),
         (
-            "diet",
-            "3️⃣ Any dietary preference or restrictions? (e.g. vegetarian, vegan, no dairy, diabetic, or \"no restrictions\")",
+            "location",
+            "3️⃣ Where do you currently live?\n\n"
+            "City: ___ (e.g. \"Indore\")",
         ),
         (
-            "activity_level",
-            "4️⃣ How active is your day-to-day? (e.g. \"mostly sitting/desk job\", \"light exercise\", \"already quite active\")",
+            "target_weight",
+            "4️⃣ What is your target weight?\n\n"
+            "Enter target weight: ___ kg / lbs\n"
+            "(e.g. \"65 kg\")\n\n"
+            "Not sure? Just reply \"Not sure\" and I'll suggest a healthy target for you.",
         ),
         (
-            "medical_conditions",
-            "5️⃣ Any existing medical conditions or injuries I should know about? "
-            "(e.g. knee pain, PCOS, thyroid, pregnancy — or \"none\")\n\n"
-            "This helps me keep every suggestion safe for you 🙏",
+            "sugar_intake",
+            "5️⃣ How much sugar or sugary food do you normally consume?\n\n"
+            "1. None or very little\n"
+            "2. Low\n"
+            "3. Moderate\n"
+            "4. High\n"
+            "5. Very high\n\n"
+            "Examples: sweets, desserts, sugary tea/coffee, soft drinks, packaged juices, etc.\n\n"
+            "Reply with the number (1-5) 👇",
         ),
         (
-            "routine_time",
-            "6️⃣ What's your typical routine, and how much time can you realistically give this each day? "
-            "(e.g. \"early mornings, 20 minutes\", \"busy till evening, 1 hour at night\")",
+            "exercise_level",
+            "6️⃣ How much exercise or physical activity do you usually get?\n\n"
+            "1. I don't exercise\n"
+            "2. Less than 10 minutes a day\n"
+            "3. 10–30 minutes a day\n"
+            "4. 30–60 minutes a day\n"
+            "5. More than 60 minutes a day\n\n"
+            "Reply with the number (1-5) 👇",
         ),
         (
-            "past_attempts",
-            "7️⃣ Almost done! Have you tried anything before that didn't work for you, or that you'd rather avoid? "
-            "(e.g. \"tried keto before\", \"hate running\", or \"nothing to avoid\")",
+            "family_obesity",
+            "7️⃣ Does obesity or significant weight gain run in your family?\n\n"
+            "1. Yes\n"
+            "2. No\n"
+            "3. Not sure\n\n"
+            "Reply with the number (1-3) 👇",
         ),
         (
-            "preferred_checkin_time",
-            "8️⃣ Last one! What time of day should I send your daily check-in? "
-            "(e.g. \"8am\", \"9:30 pm\", \"7 in the morning\" — reply in your local time, "
-            "IST/India time by default)",
+            "dairy_intake",
+            "8️⃣ Last one! How much dairy do you normally consume?\n\n"
+            "1. None\n"
+            "2. Low — occasionally\n"
+            "3. Moderate — once a day\n"
+            "4. High — 2–3 times a day\n"
+            "5. Very high — more than 3 times a day\n\n"
+            "Examples: milk, curd/yogurt, paneer, cheese, butter, cream, etc.\n\n"
+            "Reply with the number (1-5) 👇",
         ),
     ],
     # Future categories go here, e.g. "yoga": [...], "bulking": [...].
@@ -274,11 +304,186 @@ def _parse_checkin_time_strict(user_text: str) -> tuple[Optional[dict], Optional
     return {"checkin_hour_utc": hour_utc}, None
 
 
-# Maps onboarding answer key -> strict validator function. Only keys
-# present here get strict validation; all other keys are untouched.
+def _parse_height_weight(user_text: str) -> tuple[Optional[dict], Optional[str]]:
+    """Q2: reuse the strict weight+height parser, and store a normalized,
+    unit-consistent string for the plan generator."""
+    parsed, err = _parse_weight_height(user_text)
+    if err:
+        return None, err
+    parsed["normalized"] = f"Height {parsed['height_cm']:g} cm, Weight {parsed['weight_kg']:g} kg"
+    return parsed, None
+
+
+_FEMALE_RE = _re.compile(r"\b(female|woman|girl|lady|f|ladki|mahila)\b", _re.IGNORECASE)
+_MALE_RE = _re.compile(r"\b(male|man|boy|gentleman|m|ladka|purush)\b", _re.IGNORECASE)
+_PREFER_NOT_RE = _re.compile(r"prefer|rather not|not to say|skip|don'?t want|dont want", _re.IGNORECASE)
+
+
+def _parse_age_gender(user_text: str) -> tuple[Optional[dict], Optional[str]]:
+    """Q1: needs BOTH an age (12-100) and a gender (male / female /
+    prefer not to say)."""
+    text = user_text.strip()
+    nums = _re.findall(r"\b(\d{1,3})\b", text)
+    age = int(nums[0]) if nums else None
+
+    female, male = bool(_FEMALE_RE.search(text)), bool(_MALE_RE.search(text))
+    if _PREFER_NOT_RE.search(text) and not (female or male):
+        gender = "Prefer not to say"
+    elif female and not male:
+        gender = "Female"
+    elif male and not female:
+        gender = "Male"
+    else:
+        gender = None
+
+    if age is None or gender is None:
+        missing = []
+        if age is None:
+            missing.append("age")
+        if gender is None:
+            missing.append("gender (Male / Female / Prefer not to say)")
+        return None, (
+            "Hmm, I couldn't quite catch your " + " and ".join(missing) + " 🤔\n\n"
+            "Please reply like this: \"28, Female\"."
+        )
+    if not (12 <= age <= 100):
+        return None, "That age looks off to me — please double check and resend, e.g. \"28, Female\"."
+    return {"age": age, "gender": gender, "normalized": f"Age {age}, {gender}"}, None
+
+
+_NOT_SURE_RE = _re.compile(
+    r"not sure|unsure|don'?t know|dont know|no idea|idk|you (?:tell|suggest|decide)|suggest|recommend|pata nahi",
+    _re.IGNORECASE,
+)
+
+
+def _parse_target_weight(user_text: str) -> tuple[Optional[dict], Optional[str]]:
+    """Q4: a target weight with units, OR "not sure"."""
+    text = user_text.strip().lower()
+    kg: Optional[float] = None
+    m = _WEIGHT_KG_RE.search(text)
+    if m:
+        kg = float(m.group(1))
+    else:
+        m = _WEIGHT_LB_RE.search(text)
+        if m:
+            kg = float(m.group(1)) * 0.45359237
+
+    if kg is None:
+        if _NOT_SURE_RE.search(text):
+            return {"target_kg": None, "normalized": "Not sure — please recommend a healthy target weight"}, None
+        return None, (
+            "Please include your target weight with units, e.g. \"65 kg\" or \"143 lbs\" — "
+            "or reply \"Not sure\" and I'll suggest one 🙂"
+        )
+    if not (25 <= kg <= 300):
+        return None, "That target weight looks off to me — please double check and resend, e.g. \"65 kg\"."
+    kg = round(kg, 1)
+    return {"target_kg": kg, "normalized": f"{kg:g} kg"}, None
+
+
+_NOT_A_CITY = {
+    "hi", "hello", "hey", "ok", "okay", "yes", "no", "thanks", "thank you",
+    "hii", "hlo", "test", "nothing", "none", "na", "n/a",
+}
+
+
+def _parse_city(user_text: str) -> tuple[Optional[dict], Optional[str]]:
+    """Q3: a plausible city/place name (no LLM call needed)."""
+    text = " ".join(user_text.strip().split())
+    letters = sum(ch.isalpha() for ch in text)
+    ok = (
+        letters >= 2
+        and len(text) <= 60
+        and len(text.split()) <= 6
+        and "?" not in text
+        and not any(ch.isdigit() for ch in text)
+        and text.lower().strip(" .!,") not in _NOT_A_CITY
+    )
+    if not ok:
+        return None, "Please tell me the city you live in, e.g. \"Indore\" or \"Pune, Maharashtra\" 🏙️"
+    return {"city": text, "normalized": text}, None
+
+
+def _choice_validator(options: list[tuple[str, str]], order: list[int] | None = None):
+    """
+    Build a validator for a numbered multiple-choice question.
+
+    options: [(label_to_store, regex_of_free_text_synonyms), ...] in the
+             same order as the numbered list shown to the user.
+    order:   1-based option indexes in the order the free-text regexes
+             should be tried (most specific first, e.g. "very high"
+             before "high"). Defaults to 1..N.
+
+    Accepts "3", "3.", "option 3", "3 - moderate", or a recognizable phrase
+    like "very high". Anything else is rejected with a re-ask. The stored
+    answer is the canonical option label.
+    """
+    n = len(options)
+    compiled = [_re.compile(pat, _re.IGNORECASE) for _, pat in options]
+    order = order or list(range(1, n + 1))
+
+    def _validate(user_text: str) -> tuple[Optional[dict], Optional[str]]:
+        text = user_text.strip().lower()
+        digit_groups = _re.findall(r"\d+", text)
+        if len(digit_groups) == 1:
+            m = _re.match(r"^\W*(?:option\s*|opt\s*|no\.?\s*)?(\d+)(?!\d)", text)
+            if m and 1 <= int(m.group(1)) <= n:
+                label = options[int(m.group(1)) - 1][0]
+                return {"choice": label, "normalized": label}, None
+        for idx in order:
+            if compiled[idx - 1].search(text):
+                label = options[idx - 1][0]
+                return {"choice": label, "normalized": label}, None
+        return None, f"Please reply with the number of your choice (1-{n}) 🙏"
+
+    return _validate
+
+
+_SUGAR_OPTIONS = [
+    ("None or very little", r"\bnone\b|very\s*little|no\s*sugar|\bzero\b|\bno\b|nahi"),
+    ("Low", r"\blow\b|\blittle\b|rarely|occasional"),
+    ("Moderate", r"moderate|medium|average|normal|sometimes"),
+    ("High", r"\bhigh\b|\bheavy\b|a\s*lot|zyada"),
+    ("Very high", r"very\s*high|extreme|too\s*much|bahut\s*zyada"),
+]
+_EXERCISE_OPTIONS = [
+    ("I don't exercise", r"(?:don'?t|do not|dont)\s*exercise|no\s*exercise|\bnone\b|\bnever\b|\bnothing\b|\bno\b|nahi"),
+    ("Less than 10 minutes a day", r"less than 10|under 10|<\s*10|few minutes"),
+    ("10–30 minutes a day", r"\b10\s*(?:-|–|—|to)\s*30"),
+    ("30–60 minutes a day", r"\b30\s*(?:-|–|—|to)\s*60"),
+    ("More than 60 minutes a day", r"more than 60|over 60|above 60|60\s*\+|\d+\s*hours?"),
+]
+_FAMILY_OPTIONS = [
+    ("Yes", r"\byes\b|\by\b|\byeah\b|\bhaan?\b|\bha\b"),
+    ("No", r"\bno\b|\bn\b|\bnope\b|nahi"),
+    ("Not sure", r"not sure|unsure|don'?t know|dont know|no idea|maybe|idk|pata nahi"),
+]
+_DAIRY_OPTIONS = [
+    ("None", r"\bnone\b|\bno\b|\bnever\b|don'?t|do not|\bvegan\b|\bzero\b|nahi"),
+    ("Low — occasionally", r"\blow\b|occasional|rarely|sometimes|weekly"),
+    ("Moderate — once a day", r"moderate|medium|\bonce\b|one time|1 time|daily|every\s*day"),
+    ("High — 2–3 times a day", r"\bhigh\b|\b2\s*(?:-|–|—|to)\s*3\b|\btwo\b|\bthrice\b|\b3 times\b|three times"),
+    ("Very high — more than 3 times a day", r"very\s*high|more than 3|\b3\s*\+|>\s*3|\b4\s*\+|many times"),
+]
+
+
+# Maps onboarding answer key -> strict validator function. Every
+# question in the weight_loss flow is now validated deterministically
+# (no LLM classifier call is needed, which also saves cost/latency).
+# A validator returns ({"normalized": "<text to store>", ...}, None) or
+# (None, "<friendly error>"); the "normalized" string — not the raw reply
+# — is what gets saved and later fed to the plan generator.
 _STRICT_VALIDATORS = {
-    "weight_height": _parse_weight_height,
-    "preferred_checkin_time": _parse_checkin_time_strict,
+    "age_gender": _parse_age_gender,
+    "height_weight": _parse_height_weight,
+    "location": _parse_city,
+    "target_weight": _parse_target_weight,
+    "sugar_intake": _choice_validator(_SUGAR_OPTIONS, order=[5, 1, 2, 3, 4]),
+    "exercise_level": _choice_validator(_EXERCISE_OPTIONS, order=[5, 3, 4, 2, 1]),
+    "family_obesity": _choice_validator(_FAMILY_OPTIONS, order=[3, 1, 2]),
+    "dairy_intake": _choice_validator(_DAIRY_OPTIONS, order=[5, 4, 3, 2, 1]),
+    "preferred_checkin_time": _parse_checkin_time_strict,  # not asked by default any more
 }
 
 
@@ -433,6 +638,41 @@ async def _finish_onboarding(
     )
 
 
+def build_derived_profile(answers: dict) -> dict:
+    """BMI / healthy range / weight-to-lose computed from the saved
+    (normalized) onboarding answers. Best-effort: missing or unparseable
+    inputs are simply left out."""
+    out: dict = {}
+    try:
+        hw, _ = _parse_weight_height(answers.get("height_weight", "") or "")
+        if hw:
+            kg, cm = hw["weight_kg"], hw["height_cm"]
+            m = cm / 100.0
+            bmi = kg / (m * m)
+            out["current_bmi"] = round(bmi, 1)
+            out["bmi_category_who"] = (
+                "underweight" if bmi < 18.5 else
+                "normal" if bmi < 25 else
+                "overweight" if bmi < 30 else "obese"
+            )
+            lo, hi = round(18.5 * m * m, 1), round(24.9 * m * m, 1)
+            out["healthy_weight_range_kg"] = f"{lo}-{hi}"
+            tw = answers.get("target_weight", "") or ""
+            tgt, _ = _parse_target_weight(tw)
+            if tgt and tgt.get("target_kg"):
+                out["target_weight_kg"] = tgt["target_kg"]
+                out["kg_to_lose"] = round(kg - tgt["target_kg"], 1)
+            else:
+                out["target_weight_note"] = (
+                    "User is NOT sure of a target — pick a realistic, healthy target "
+                    "inside healthy_weight_range_kg (a first milestone of 5-10% of "
+                    "current weight is fine) and frame the plan around it."
+                )
+    except Exception as e:
+        logger.warning(f"⚠️ Could not build derived profile: {e}")
+    return out
+
+
 _PLAN_LOCK_TTL_SECONDS = 600
 _PLAN_GEN_ATTEMPTS = 3
 _PLAN_GEN_RETRY_DELAYS = (5, 20)  # seconds between attempts
@@ -503,6 +743,17 @@ async def generate_and_send_plan(
             except Exception as e:
                 logger.warning(f"⚠️ Language detection failed for {phone_number}: {e}")
 
+        # Computed facts (BMI, kg to lose, healthy range...) so the plan is
+        # driven by the user's real numbers, not just their raw text.
+        answers = {**answers, "derived_profile": build_derived_profile(answers)}
+
+        # WhatsApp profile name (saved from the webhook); None if unknown.
+        user_name = None
+        try:
+            user_name = (await asyncio.to_thread(memory.get_customer, phone_number)).get("name")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not load user name for {phone_number}: {e}")
+
         days = None
         for attempt in range(1, _PLAN_GEN_ATTEMPTS + 1):
             try:
@@ -511,6 +762,7 @@ async def generate_and_send_plan(
                     category=category,
                     total_days=settings.PREMIUM_PLAN_DAYS,
                     required_language=required_language,
+                    user_name=user_name,
                 )
                 break
             except (GeminiUnavailableError, ValueError) as e:
@@ -567,7 +819,7 @@ async def _send_plan_day_now(
     window_open = False
     if last_inbound_at is not None:
         if last_inbound_at.tzinfo is not None:
-            last_inbound_at = last_inbound_at.replace(tzinfo=None)
+            last_inbound_at = last_inbound_at.astimezone(timezone.utc).replace(tzinfo=None)
         window_open = (datetime.utcnow() - last_inbound_at) < timedelta(
             hours=settings.WHATSAPP_SESSION_WINDOW_HOURS
         )
@@ -626,6 +878,26 @@ async def handle_onboarding_reply(
         await _finish_onboarding(memory, phone_number)
         return True
 
+    # Production safety: a session that was started under the OLD question
+    # set (answers saved under keys that no longer exist) would otherwise
+    # mix old and new answers. Restart it cleanly with the new questions.
+    saved_answers = session.get("answers") or {}
+    if isinstance(saved_answers, str):
+        import json as _json_mod
+        try:
+            saved_answers = _json_mod.loads(saved_answers)
+        except Exception:
+            saved_answers = {}
+    valid_keys = {key for key, _ in questions}
+    if set(saved_answers) - valid_keys:
+        logger.info(f"🔄 Restarting legacy onboarding session for {phone_number} (question set changed).")
+        await start_onboarding(
+            memory, phone_number, category=category,
+            intro_text="We've upgraded our questions to personalize your plan even better 🙂 "
+                       "Sorry for the repeat — it only takes a minute!",
+        )
+        return True
+
     current_key, current_prompt = questions[question_index]
 
     await asyncio.to_thread(
@@ -655,8 +927,9 @@ async def handle_onboarding_reply(
         # here only to gate acceptance. preferred_checkin_time's raw text
         # is still what _parse_preferred_hour_to_utc re-parses later in
         # _finish_onboarding.
+        answer_to_store = (parsed_value or {}).get("normalized") or user_text
         new_index = await asyncio.to_thread(
-            memory.save_onboarding_answer, phone_number, current_key, user_text
+            memory.save_onboarding_answer, phone_number, current_key, answer_to_store
         )
         if new_index >= len(questions):
             await _finish_onboarding(memory, phone_number)

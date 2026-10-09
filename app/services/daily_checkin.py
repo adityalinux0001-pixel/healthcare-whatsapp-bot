@@ -29,7 +29,7 @@ single entry point one job invocation should call once per day.
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.config import get_settings
@@ -73,7 +73,7 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
     last_sent_at = await asyncio.to_thread(memory.get_last_checkin_sent_at, phone_number)
     if last_sent_at is not None:
         if last_sent_at.tzinfo is not None:
-            last_sent_at = last_sent_at.replace(tzinfo=None)
+            last_sent_at = last_sent_at.astimezone(timezone.utc).replace(tzinfo=None)
         hours_since = (now - last_sent_at).total_seconds() / 3600
         if hours_since < settings.DAILY_CHECKIN_MIN_GAP_HOURS:
             logger.info(
@@ -124,7 +124,7 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
     window_open = False
     if last_inbound_at is not None:
         if last_inbound_at.tzinfo is not None:
-            last_inbound_at = last_inbound_at.replace(tzinfo=None)
+            last_inbound_at = last_inbound_at.astimezone(timezone.utc).replace(tzinfo=None)
         window_open = (now - last_inbound_at) < timedelta(hours=settings.WHATSAPP_SESSION_WINDOW_HOURS)
 
     if not window_open:
@@ -216,6 +216,32 @@ async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
     logger.info(f"📅 Daily check-in run finished for hour {current_hour_utc}:00 UTC.")
 
 
+_REPAIR_COOLDOWN_SECONDS = 240
+_REPAIR_MAX_ATTEMPTS = 8
+
+
+async def _repair_allowed(phone_number: str) -> bool:
+    """At most one repair attempt per user every few minutes, and a hard cap,
+    so a persistent Gemini problem can't turn into an endless paid-call loop.
+    Fails open if Redis is unavailable."""
+    try:
+        from app.core.redis_client import get_redis
+        redis = get_redis()
+        if not await redis.set(f"plan_repair_cooldown:{phone_number}", "1", nx=True, ex=_REPAIR_COOLDOWN_SECONDS):
+            return False
+        attempts = await redis.incr(f"plan_repair_attempts:{phone_number}")
+        await redis.expire(f"plan_repair_attempts:{phone_number}", 6 * 3600)
+        if attempts > _REPAIR_MAX_ATTEMPTS:
+            logger.error(
+                f"🛑 Repair: giving up on {phone_number} after {_REPAIR_MAX_ATTEMPTS} attempts "
+                f"(check Gemini errors in the logs, then clear the key plan_repair_attempts:{phone_number})."
+            )
+            return False
+    except Exception as e:
+        logger.warning(f"⚠️ Repair throttle unavailable ({e}) — allowing.")
+    return True
+
+
 async def repair_missing_plans() -> None:
     """
     Safety net for the "paid but Day 1 never arrived" case: any active
@@ -230,6 +256,8 @@ async def repair_missing_plans() -> None:
         logger.error(f"❌ Repair: could not list paid users without plan: {e}", exc_info=True)
         return
     for phone_number in phones:
+        if not await _repair_allowed(phone_number):
+            continue
         logger.warning(f"🛠️ Repair: {phone_number} is paid but has no plan — generating now.")
         try:
             await generate_and_send_plan(memory, phone_number)

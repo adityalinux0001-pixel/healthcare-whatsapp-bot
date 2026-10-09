@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import uuid
+import re as _re_plan
 import json as _json
 from functools import lru_cache
 from app.core.config import get_settings
@@ -1104,9 +1105,26 @@ PHASE 3 — CONSOLIDATION & MINDSET (final third):
 
 Message quality requirements (this is what makes each day feel like real coaching, not a random tip):
 - Every message should briefly connect the ONE action to why it matters in plain, non-clinical language (e.g., grounding it in momentum, energy, consistency, or how the body responds) — one short reason, not a lecture.
-- Give exactly ONE specific, concrete, doable action per day. Never vague ("eat healthier", "be more active") — always a specific swap, a specific movement, a specific check-in, or a specific reflection prompt.
+- Every day ALSO includes a simple, personalized one-day diet (Breakfast / Lunch / Snack / Dinner) in household portions (e.g. "2 rotis", "1 katori dal", "1 fruit"), built from the user's location, sugar and dairy habits as described in PERSONALIZATION. Give exactly ONE specific, concrete, doable action per day (separate from the meals). Never vague ("eat healthier", "be more active") — always a specific swap, a specific movement, a specific check-in, or a specific reflection prompt.
 - Each day must clearly build on or connect to what came before within its phase, so the plan reads as one coherent 21-day arc, not {total_days} unrelated tips.
 - Reference the plan's day number and phase-appropriate framing (e.g., early days = "let's just notice", later days = "you've already built X, now let's add Y") so continuity is felt.
+
+PERSONALIZATION — the plan MUST be driven by this user's own onboarding answers (and the computed "derived_profile" in the input), not a generic template:
+- age_gender: calibrate tone, portion and activity suggestions to their age and gender. If age is under 18, keep everything gentle and growth-supportive (no restriction, no fat-loss pressure) and encourage involving a parent and a doctor.
+- height_weight + derived_profile (BMI, bmi_category_who, healthy_weight_range_kg, kg_to_lose): set how ambitious the plan is. Overweight/obese -> steady fat-loss focus; normal BMI -> gentle recomposition/toning, no aggressive cutting; underweight -> do NOT build a weight-loss plan, focus on nourishing, healthy habits and suggest seeing a doctor/dietitian. Never print the BMI or the kg numbers as promises or timelines.
+- target_weight: if given, aim the plan at it, pacing the program accordingly. If they were not sure, use the target suggested in derived_profile.target_weight_note and frame it as "a healthy goal range".
+- location (city): build EVERY day's meals from foods that are common, affordable and easy to find in that city/region (local staples, regional dishes, seasonal produce). Do not suggest hard-to-find or exotic items.
+- sugar_intake: build a gradual sugar-reduction ladder across the days - None/very low: just protect it; Low: small swaps; Moderate: step-down swaps (sugary tea/coffee, sweets, soft drinks, packaged juice); High/Very high: start with ONE swap and taper slowly across the plan, never "quit everything on day 1".
+- exercise_level: start where they are and ramp up slowly. "I don't exercise" -> 5-10 minute easy walks first; under 10 min -> add short bouts; 10-30 -> build toward 30-45 min; 30-60 or 60+ -> keep consistency and add variety/strength, avoid overtraining. Never jump more than one level.
+- family_obesity: Yes -> steady, long-term habit framing (consistency, sleep, regular check-ups); No/Not sure -> keep neutral. Never frighten or label the user.
+- dairy_intake: None -> make sure calcium/protein come from other foods; Low/Moderate -> keep dairy as a protein source; High/Very high -> gradually swap toward toned/low-fat versions and smaller portions (milk tea, paneer, cheese, butter, cream, sweet curd) over the days.
+- Diet type (veg / non-veg / allergies) is NOT asked: default to a vegetarian-friendly base with simple optional egg/chicken/fish swaps. If the user mentions a restriction in their answers, follow it.
+- Vary the meals across the days (no copy-paste days), keep them realistic for a normal household, and let each day's meal choices reflect that day's phase and action.
+
+FINAL TEXT RULES (every message is sent to the user exactly as written):
+- NEVER output placeholders or template markers: no square-bracket, curly-brace or angle-bracket markers (for a name, a food, anything), no "..." and no "sample" text. Write complete, final, real content only.
+- Use the name in [USER FIRST NAME] if one is given; if it says UNKNOWN, address the user without any name. Never invent a name.
+- Day 1 must start directly with real, specific content (their first action and first day's meals), not a "sample" or "example" plan.
 
 Safety & Customization Rules:
 - Adhere strictly to any listed injuries, medical conditions, or physical restrictions (e.g., no high-impact moves if knee pain is noted). Keep guidance safe and generic for chronic conditions (PCOS, diabetes, thyroid) — never contradict a doctor's plan, always defer to one for anything medical.
@@ -1120,14 +1138,16 @@ Safety & Customization Rules:
 
 def _plan_category_system_prompt(category: str, total_days: int) -> str:
     template = PLAN_CATEGORY_PROMPTS.get(category, PLAN_CATEGORY_PROMPTS["weight_loss"])
-    return template.format(total_days=total_days).strip()
+    # .replace (not .format): the prompt text may legitimately contain
+    # braces, and a stray "{x}" must never be able to crash plan generation.
+    return template.replace("{total_days}", str(total_days)).strip()
 
 
 _PLAN_OUTPUT_FORMAT_INSTRUCTIONS = """
 [OUTPUT FORMAT — FOLLOW EXACTLY]
 Respond ONLY with a single JSON array containing exactly {total_days} objects corresponding to each ordered day. No markdown fences, preambles, or trailing text. Each object must contain exactly these two keys:
 
-  "message": A plain-text WhatsApp message (4-7 sentences, in {language}) — long enough to feel like genuine, descriptive coaching rather than a one-line tip. Structure it as: (1) a brief natural reference to today/their progress, (2) the ONE specific action for today stated clearly, (3) one short "why this matters" line connecting it to momentum, energy, or consistency, and (4) a brief note on how to actually do it today (timing, a simple substitution, or a way to make it easier). Friendly, conversational, genuinely encouraging tone decorated with 2-3 well-placed emojis (e.g., 💪, 🥗, 🎯). Vary emoji combinations day-to-day to avoid repetition. Never replace text clarity with symbols, and never state calorie counts, macro numbers, or specific weight-loss amounts/timelines.
+  "message": A plain-text WhatsApp message (in {language}), at most about 800 characters in total so it fits in a single WhatsApp message. Structure it as: (1) a brief natural reference to today/their progress, (2) the ONE specific action for today stated clearly with one short "why this matters" line, and (3) today's personalized diet on separate short lines - "🍳 Breakfast: ...", "🍛 Lunch: ...", "🍎 Snack: ...", "🥗 Dinner: ..." - using foods common in the user's city, in household portions, with no calorie or macro numbers. Friendly, conversational, genuinely encouraging tone decorated with 2-3 well-placed emojis (e.g., 💪, 🥗, 🎯). Vary emoji combinations day-to-day to avoid repetition. Never replace text clarity with symbols, and never state calorie counts, macro numbers, or specific weight-loss amounts/timelines.
   "followup_question": A short, single-sentence engagement question (in {language}) decorated with exactly ONE relevant emoji, designed to check in on their progress later that day. Do not reference this question inside the "message".
 
 Example structure:
@@ -1138,71 +1158,100 @@ Example structure:
 """.strip()
 
 
-async def generate_premium_plan(
-    onboarding_answers: dict,
+_NAME_PLACEHOLDER_RE = _re_plan.compile(
+    r"[\[\{<]{1,2}\s*(?:user'?s?[\s_-]*)?(?:first[\s_-]*|full[\s_-]*)?name\s*[\]\}>]{1,2}",
+    _re_plan.IGNORECASE,
+)
+_ANY_BRACKET_PLACEHOLDER_RE = _re_plan.compile(r"[\[\{]{1,2}[^\]\}\n]{1,40}[\]\}]{1,2}")
+
+
+def first_name_from_profile(raw_name: str | None) -> str | None:
+    """Usable first name from the WhatsApp profile name, or None for the
+    default "Customer", emoji-only or otherwise unusable names."""
+    if not raw_name:
+        return None
+    parts = [t.strip(".,") for t in raw_name.split() if t.strip(".,")]
+    while parts and parts[0].lower() in {"dr", "mr", "mrs", "ms", "miss", "prof", "shri", "smt"}:
+        parts = parts[1:]
+    token = parts[0] if parts else ""
+    letters = sum(ch.isalpha() for ch in token)
+    if token.lower() == "customer" or letters < 2 or len(token) > 20:
+        return None
+    return token[:1].upper() + token[1:] if token.islower() else token
+
+
+def clean_plan_text(text: str, first_name: str | None) -> str:
+    """Safety net for pre-generated plan text: swap any leftover name
+    placeholder like "[user name]" / "{name}" for the real first name (or drop
+    it cleanly when we have none), and remove any other [bracketed] template
+    placeholders, so users never see raw template text."""
+    out = _NAME_PLACEHOLDER_RE.sub(first_name or "", text)
+    out = _ANY_BRACKET_PLACEHOLDER_RE.sub("", out)
+    out = _re_plan.sub(r"[ \t]+", " ", out)
+    out = _re_plan.sub(r"\s+([,!.?])", r"\1", out)      # "Hi ," -> "Hi,"
+    out = _re_plan.sub(r",\s*,+", ",", out)               # ", ," -> ","
+    out = _re_plan.sub(r",\s*([!.?])", r"\1", out)       # ",!" -> "!"
+    return out.strip()
+
+
+_PLAN_CHUNK_DAYS = 7  # days generated per Gemini call (3 calls for 21 days)
+
+
+def _plan_phase_for_day(day: int, total_days: int) -> str:
+    third = total_days / 3.0
+    if day <= third:
+        return "PHASE 1 - AWARENESS & BASELINE"
+    if day <= 2 * third:
+        return "PHASE 2 - BUILDING CORE HABITS"
+    return "PHASE 3 - CONSOLIDATION & MINDSET"
+
+
+async def _generate_plan_chunk(
+    client,
+    *,
     category: str,
     total_days: int,
-    required_language: str | None = None,
+    day_start: int,
+    day_end: int,
+    answers_json: str,
+    first_name_line: str,
+    language: str,
 ) -> list[dict]:
+    """Generate days [day_start..day_end] of the plan in ONE Gemini call.
+
+    The whole plan used to be one giant call (21 days x meals); that is
+    slow and fragile — a truncated or malformed JSON array lost the entire
+    plan. Smaller chunks (run in parallel) stay far below the output
+    limit. Thinking is disabled: for this structured-writing task it only
+    burns the output-token budget.
     """
-    ONE Gemini call that generates the entire {total_days}-day premium plan
-    up front: for every day, both the message to send AND that day's
-    same-day follow-up question. Called exactly once, right after
-    onboarding finishes (see app/onboarding.py), and the result is written
-    to the premium_plans table (see app/memory.py) as one row per day.
-
-    No LLM calls happen again for this user's plan after this point — the
-    daily scheduler (app/daily_checkin.py) only ever fetches pre-written
-    rows and sends them.
-
-    Args:
-        onboarding_answers: dict of the answers collected during onboarding
-            (weight/height, goal, diet, activity level, medical conditions,
-            routine/time available, past attempts — see app/onboarding.py
-            for the exact question set).
-        category: plan category, e.g. "weight_loss" (see
-            settings.DEFAULT_PLAN_CATEGORY and PLAN_CATEGORY_PROMPTS above).
-        total_days: length of the plan (settings.PREMIUM_PLAN_DAYS).
-        required_language: language to write in; defaults to English.
-
-    Returns:
-        A list of exactly `total_days` dicts, each shaped
-        {"message": str, "followup_question": str}, in day order
-        (index 0 = day 1).
-
-    Raises:
-        GeminiUnavailableError: Gemini is down/overloaded — caller should
-            NOT activate/save a half-formed plan and should let the
-            subscription-activation flow retry or alert an operator,
-            since silently failing here means the user paid for a premium
-            plan that never materializes.
-        ValueError: Gemini responded but not with valid, complete JSON for
-            all {total_days} days — treated the same as unavailable by
-            callers (don't save a partial/malformed plan).
-    """
-    client = _get_client()
-    language = required_language or "English"
-
+    n = day_end - day_start + 1
     system_prompt = _plan_category_system_prompt(category, total_days)
-    output_format = _PLAN_OUTPUT_FORMAT_INSTRUCTIONS.format(
-        total_days=total_days, language=language
-    )
+    output_format = _PLAN_OUTPUT_FORMAT_INSTRUCTIONS.format(total_days=n, language=language)
     full_system_prompt = f"{system_prompt}\n\n{output_format}"
 
-    answers_json = _json.dumps(onboarding_answers, indent=2, ensure_ascii=False)
     prompt = f"""
 [ONBOARDING ANSWERS FOR THIS USER]
 {answers_json}
 
+[USER FIRST NAME]
+{first_name_line}
+
 [PLAN LENGTH]
-{total_days} days
+{total_days} days in total
+
+[DAYS TO WRITE NOW]
+Write ONLY days {day_start} to {day_end} (that is {n} days) of the {total_days}-day plan, in order.
+Day {day_start} is in {_plan_phase_for_day(day_start, total_days)}; day {day_end} is in {_plan_phase_for_day(day_end, total_days)}.
+{"This is the start of the program: Day 1 must open warmly and begin with real, specific content." if day_start == 1 else f"Days 1-{day_start - 1} were already written separately; continue the same arc without repeating earlier days, and do not re-introduce the program."}
 
 [REQUIRED_LANGUAGE]
 {language}
 
-Generate the full {total_days}-day JSON plan now, following the rules and format exactly.
+Return the JSON array of exactly {n} objects now, following the rules and format exactly.
 """.strip()
 
+    settings = get_settings()
     try:
         response = await _call_gemini(
             lambda: client.aio.models.generate_content(
@@ -1210,51 +1259,116 @@ Generate the full {total_days}-day JSON plan now, following the rules and format
                 contents=[types.Part(text=prompt)],
                 config=types.GenerateContentConfig(
                     system_instruction=full_system_prompt,
-                    max_output_tokens=get_settings().PLAN_GENERATION_MAX_OUTPUT_TOKENS,
+                    max_output_tokens=settings.PLAN_GENERATION_MAX_OUTPUT_TOKENS,
                     temperature=0.6,
                     response_mime_type="application/json",
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             ),
-            label="premium plan pregeneration",
+            label=f"premium plan days {day_start}-{day_end}",
         )
     except Exception as e:
         if _is_transient_gemini_error(e):
-            logger.warning(f"Gemini unavailable during premium plan pregeneration: {e}")
+            logger.warning(f"Gemini unavailable during premium plan days {day_start}-{day_end}: {e}")
             raise GeminiUnavailableError(str(e)) from e
         raise
 
     raw_text = (response.text or "").strip()
-
     try:
         parsed = _json.loads(raw_text)
     except _json.JSONDecodeError as e:
-        logger.error(f"❌ Plan pregeneration returned invalid JSON: {e} | raw[:500]={raw_text[:500]}")
-        raise ValueError(f"Invalid JSON from plan generation: {e}") from e
-
-    if not isinstance(parsed, list) or len(parsed) != total_days:
         logger.error(
-            f"❌ Plan pregeneration returned wrong shape — expected a {total_days}-item "
-            f"list, got {type(parsed).__name__} of len "
-            f"{len(parsed) if isinstance(parsed, list) else 'n/a'}."
+            f"❌ Plan days {day_start}-{day_end}: invalid JSON ({e}) | "
+            f"len={len(raw_text)} | tail={raw_text[-200:]!r}"
         )
-        raise ValueError(
-            f"Expected {total_days} plan days, got "
-            f"{len(parsed) if isinstance(parsed, list) else type(parsed).__name__}"
-        )
+        raise ValueError(f"Invalid JSON from plan generation (days {day_start}-{day_end}): {e}") from e
+
+    if not isinstance(parsed, list) or len(parsed) != n:
+        got = len(parsed) if isinstance(parsed, list) else type(parsed).__name__
+        logger.error(f"❌ Plan days {day_start}-{day_end}: expected {n} items, got {got}")
+        raise ValueError(f"Expected {n} plan days for {day_start}-{day_end}, got {got}")
 
     days: list[dict] = []
-    for i, item in enumerate(parsed, start=1):
+    for offset, item in enumerate(parsed):
+        day_no = day_start + offset
         if not isinstance(item, dict) or "message" not in item or "followup_question" not in item:
-            logger.error(f"❌ Plan pregeneration day {i} malformed: {item!r}")
-            raise ValueError(f"Day {i} missing required keys 'message'/'followup_question'")
-        message = _strip_leaked_meta_text(str(item["message"]).strip())
+            logger.error(f"❌ Plan day {day_no} malformed: {item!r}")
+            raise ValueError(f"Day {day_no} missing required keys 'message'/'followup_question'")
+        message = str(item["message"]).strip()
         followup_question = str(item["followup_question"]).strip()
         if not message or not followup_question:
-            raise ValueError(f"Day {i} has an empty message or followup_question")
+            raise ValueError(f"Day {day_no} has an empty message or followup_question")
         days.append({"message": message, "followup_question": followup_question})
+    return days
+
+
+async def generate_premium_plan(
+    onboarding_answers: dict,
+    category: str,
+    total_days: int,
+    required_language: str | None = None,
+    user_name: str | None = None,
+) -> list[dict]:
+    """
+    Generate the entire {total_days}-day premium plan up front (message +
+    same-day follow-up question per day), personalized from the onboarding
+    answers. Called once per paying user (see app/services/onboarding.py);
+    the result is saved to premium_plans and the daily scheduler only ever
+    sends pre-written rows.
+
+    Implementation: the plan is written in chunks of _PLAN_CHUNK_DAYS days,
+    in parallel (3 calls for 21 days) instead of one giant call — faster and
+    far less likely to be truncated/malformed.
+
+    Returns exactly `total_days` dicts {"message", "followup_question"}
+    (index 0 = day 1).
+
+    Raises:
+        GeminiUnavailableError: Gemini is down/overloaded.
+        ValueError: Gemini answered, but not with valid, complete JSON for
+            every day — callers must not save a partial plan.
+    """
+    client = _get_client()
+    language = required_language or "English"
+
+    first_name = first_name_from_profile(user_name)
+    first_name_line = (
+        f"{first_name} — you may greet them by this name occasionally (e.g. on Day 1 and a few milestone days), not in every message."
+        if first_name else
+        "UNKNOWN — do NOT address the user by name at all; use a warm greeting without a name."
+    )
+    answers_json = _json.dumps(onboarding_answers, indent=2, ensure_ascii=False)
+
+    ranges = [
+        (start, min(start + _PLAN_CHUNK_DAYS - 1, total_days))
+        for start in range(1, total_days + 1, _PLAN_CHUNK_DAYS)
+    ]
+    chunks = await asyncio.gather(*[
+        _generate_plan_chunk(
+            client,
+            category=category,
+            total_days=total_days,
+            day_start=a,
+            day_end=b,
+            answers_json=answers_json,
+            first_name_line=first_name_line,
+            language=language,
+        )
+        for a, b in ranges
+    ])
+
+    days: list[dict] = []
+    for chunk in chunks:
+        days.extend(chunk)
+    if len(days) != total_days:
+        raise ValueError(f"Expected {total_days} plan days, got {len(days)}")
+
+    for d in days:
+        d["message"] = clean_plan_text(_strip_leaked_meta_text(d["message"]), first_name)
+        d["followup_question"] = clean_plan_text(d["followup_question"], first_name)
 
     logger.info(
-        f"✅ Pregenerated {len(days)}-day '{category}' plan in one Gemini call "
+        f"✅ Pregenerated {len(days)}-day '{category}' plan in {len(ranges)} parallel Gemini calls "
         f"(language={language})."
     )
     return days

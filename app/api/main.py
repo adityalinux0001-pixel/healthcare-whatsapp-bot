@@ -287,7 +287,7 @@ HARD OVERRIDE — READ FIRST: You have already asked {questions_asked_so_far} in
 
 Answer only the current user message directly and briefly. Use the conversation context solely for consistency—do not re-summarize or restate past messages.
 
-The SAVED ONBOARDING PROFILE contains the user's answers collected earlier. Treat those answers as authoritative facts for this user. Do not ask the user again for any detail that is present there, even if it is not repeated in recent conversation history. If the profile contains a field such as age, gender, weight, height, goal, diet, activity, medical conditions, routine, or past attempts, use it when relevant and never ask for it again unless the user clearly says it has changed.
+The SAVED ONBOARDING PROFILE contains the user's answers collected earlier. Treat those answers as authoritative facts for this user. Do not ask the user again for any detail that is present there, even if it is not repeated in recent conversation history. If the profile contains a field such as age, gender, height, weight, target weight, location/city, sugar intake, exercise level, family history of obesity, dairy intake, or any other saved detail, use it when relevant and never ask for it again unless the user clearly says it has changed.
 
 CRITICAL INTAKE CHECK: Review [SAVED ONBOARDING PROFILE], [CUSTOMER SUMMARY], and context carefully. If in SYMPTOM INTAKE MODE, NEVER ask for details (duration, severity, etc.) already provided. Ask only for the next missing detail. If all necessary information is present, stop questioning and provide your final guidance.
 {force_answer_instruction}

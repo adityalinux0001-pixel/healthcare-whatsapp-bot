@@ -25,6 +25,7 @@ import logging
 
 from app.core.config import get_settings
 from app.services.whatsapp import send_text_message, send_reply_buttons
+from app.services.llm import clean_plan_text, first_name_from_profile
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -67,9 +68,23 @@ async def send_plan_day(
     Returns True if the plan content itself was delivered.
     """
     day_number = plan_day["day_number"]
+
+    # Last line of defence (also fixes plans generated before this check
+    # existed): never send leftover "[user name]"-style placeholders. Uses
+    # the WhatsApp profile name when we have one, otherwise drops it.
+    first_name = None
+    try:
+        first_name = first_name_from_profile(
+            (await asyncio.to_thread(memory.get_customer, phone_number)).get("name")
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Could not load user name for {phone_number}: {e}")
+    plan_text = clean_plan_text(plan_day["message_text"], first_name)
+    followup_text = clean_plan_text(plan_day.get("followup_question") or "", first_name) or None
+
     header = f"*Day {day_number} of {settings.PREMIUM_PLAN_DAYS}* 🗓️\n\n"
-    message = f"{prefix}{header}{plan_day['message_text']}"
-    confirm_body = build_confirm_body(plan_day.get("followup_question"))
+    message = f"{prefix}{header}{plan_text}"
+    confirm_body = build_confirm_body(followup_text)
 
     combined = f"{message}\n\n{confirm_body}"
     single_message = len(combined) <= _BUTTON_BODY_LIMIT
