@@ -799,6 +799,20 @@ class ConversationMemory:
             row = cur.fetchone()
             return row[0] if row else None
 
+    def get_last_plan_sent_at(self, phone_number: str) -> Optional[datetime]:
+        """When the user's most recent plan day was actually sent. The daily
+        scheduler's "already sent today?" / minimum-gap checks use THIS.
+        (get_last_checkin_sent_at reads the legacy daily_checkins table,
+        which the pregenerated-plan system no longer writes to.)"""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute('''
+                SELECT MAX(sent_at) FROM premium_plans
+                WHERE phone_number = %s AND sent_at IS NOT NULL
+            ''', (phone_number,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
     def get_recent_checkin_messages(self, phone_number: str, limit: int = 5) -> List[str]:
         with self._get_conn() as conn:
             cur = conn.cursor()

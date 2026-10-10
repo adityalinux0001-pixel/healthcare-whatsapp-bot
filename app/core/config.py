@@ -83,8 +83,8 @@ class Settings(BaseSettings):
     PREMIUM_PLAN_DAYS: int = 21
 
     DAILY_CHECKIN_ENABLED: bool = True
-    DAILY_CHECKIN_HOUR_UTC: int = 3
-    DAILY_CHECKIN_MIN_GAP_HOURS: int = 20
+    DAILY_CHECKIN_HOUR_UTC: int = 2  # 3:00 UTC = 8:30 AM IST
+    DAILY_CHECKIN_MIN_GAP_HOURS: int = 8  # min hours between two plan messages (Day 1 is sent right after payment)
 
     # WhatsApp only allows free-form text within 24h of the user's last
     # inbound message; outside that window a plain send_text_message call

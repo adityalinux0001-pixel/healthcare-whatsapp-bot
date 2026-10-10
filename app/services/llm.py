@@ -1226,6 +1226,17 @@ async def _generate_plan_chunk(
     burns the output-token budget.
     """
     n = day_end - day_start + 1
+    DAY1_RULES = (
+        "DAY 1 EXCEPTION (overrides the Breakfast/Lunch/Snack/Dinner format for Day 1 ONLY): "
+        "Day 1 is a flexible STARTER DAY that is delivered right after the user joins, at ANY time of the day "
+        "(it might arrive at 7 AM or at 9 PM), so do NOT list time-specific meals or say 'this morning'. "
+        "Write it as: (1) a warm welcome and what the plan will do for them, (2) 2-3 small things to do for the REST OF TODAY "
+        "(e.g. drink water, a light walk if possible, make their NEXT meal a balanced plate built from local foods, "
+        "keep dinner light, avoid sugary drinks tonight), "
+        "(3) one simple 'next meal' suggestion using foods common in their city, and "
+        "(4) a closing line that tomorrow morning Day 2 arrives with their full-day plan (breakfast to dinner plus exercise). "
+        "Keep it short and encouraging. Days 2+ follow the normal full-day format."
+    )
     system_prompt = _plan_category_system_prompt(category, total_days)
     output_format = _PLAN_OUTPUT_FORMAT_INSTRUCTIONS.format(total_days=n, language=language)
     full_system_prompt = f"{system_prompt}\n\n{output_format}"
@@ -1243,7 +1254,7 @@ async def _generate_plan_chunk(
 [DAYS TO WRITE NOW]
 Write ONLY days {day_start} to {day_end} (that is {n} days) of the {total_days}-day plan, in order.
 Day {day_start} is in {_plan_phase_for_day(day_start, total_days)}; day {day_end} is in {_plan_phase_for_day(day_end, total_days)}.
-{"This is the start of the program: Day 1 must open warmly and begin with real, specific content." if day_start == 1 else f"Days 1-{day_start - 1} were already written separately; continue the same arc without repeating earlier days, and do not re-introduce the program."}
+{DAY1_RULES if day_start == 1 else f"Days 1-{day_start - 1} were already written separately; continue the same arc without repeating earlier days, and do not re-introduce the program."}
 
 [REQUIRED_LANGUAGE]
 {language}

@@ -69,16 +69,30 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
     """
     now = datetime.utcnow()
 
+    # Today's delivery slot for this user (their chosen hour, else the
+    # default). The scheduler now polls regularly and treats the slot as
+    # "from this hour on", so a restart / short outage at the exact hour no
+    # longer skips the day (catch-up).
+    slot_hour = preferred_hour_utc if preferred_hour_utc is not None else settings.DAILY_CHECKIN_HOUR_UTC
+    slot_today = now.replace(hour=slot_hour, minute=0, second=0, microsecond=0)
+    if now < slot_today:
+        return
 
-    last_sent_at = await asyncio.to_thread(memory.get_last_checkin_sent_at, phone_number)
+    last_sent_at = await asyncio.to_thread(memory.get_last_plan_sent_at, phone_number)
     if last_sent_at is not None:
         if last_sent_at.tzinfo is not None:
             last_sent_at = last_sent_at.astimezone(timezone.utc).replace(tzinfo=None)
-        hours_since = (now - last_sent_at).total_seconds() / 3600
-        if hours_since < settings.DAILY_CHECKIN_MIN_GAP_HOURS:
-            logger.info(
-                f"⏭️ Skipping check-in for {phone_number} — last one sent "
-                f"{hours_since:.1f}h ago (throttle: {settings.DAILY_CHECKIN_MIN_GAP_HOURS}h)."
+        if last_sent_at >= slot_today:
+            return  # already got today's message
+        # The previous message (e.g. Day 1, sent right after payment at ANY
+        # time of day) must be at least MIN_GAP hours older than today's
+        # slot; otherwise the next day waits for TOMORROW's morning slot
+        # instead of being sent a few hours later the same day.
+        gap_to_slot_hours = (slot_today - last_sent_at).total_seconds() / 3600
+        if gap_to_slot_hours < settings.DAILY_CHECKIN_MIN_GAP_HOURS:
+            logger.debug(
+                f"⏭️ {phone_number}: last message was only {gap_to_slot_hours:.1f}h before today's "
+                f"slot (min {settings.DAILY_CHECKIN_MIN_GAP_HOURS}h) — next one goes out tomorrow morning."
             )
             return
 
@@ -94,6 +108,11 @@ async def _send_checkin_for_user(phone_number: str, preferred_hour_utc: "int | N
         return
 
     day_number = plan_day["day_number"]
+
+    # Already HELD (window closed / previous day unconfirmed): it is released
+    # by the user's next message or button tap (main.py), never by polling.
+    if plan_day.get("template_nudge_sent_at") is not None:
+        return
 
     # CONFIRMATION GATE: tomorrow's task is only sent if the user confirmed
     # the previous day's task (Done / Not done button, or a text reply to
@@ -190,20 +209,22 @@ async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
         logger.info("Daily check-in feature disabled (daily_checkin_enabled=False) — skipping run.")
         return
 
-    if current_hour_utc is None:
-        current_hour_utc = datetime.utcnow().hour
-
     users = await asyncio.to_thread(memory.get_active_premium_users)
-    due_users = [
-        u for u in users
-        if (u.get("preferred_checkin_hour_utc")
-            if u.get("preferred_checkin_hour_utc") is not None
-            else settings.DAILY_CHECKIN_HOUR_UTC) == current_hour_utc
-    ]
-    logger.info(
-        f"📅 Daily check-in run starting for hour {current_hour_utc}:00 UTC — "
-        f"{len(due_users)} of {len(users)} active premium user(s) due this hour."
-    )
+    now_hour = datetime.utcnow().hour
+
+    def _slot_hour(u: dict) -> int:
+        h = u.get("preferred_checkin_hour_utc")
+        return h if h is not None else settings.DAILY_CHECKIN_HOUR_UTC
+
+    if current_hour_utc is not None:
+        # Explicit hour (manual / external cron): users whose slot is exactly this hour.
+        due_users = [u for u in users if _slot_hour(u) == current_hour_utc]
+    else:
+        # Normal mode: everyone whose slot has already started today. Users
+        # who already got today's message are skipped inside
+        # _send_checkin_for_user, so polling is safe and idempotent.
+        due_users = [u for u in users if _slot_hour(u) <= now_hour]
+    logger.debug(f"📅 Daily check-in poll: {len(due_users)} of {len(users)} active premium user(s) eligible.")
 
     for user in due_users:
         phone_number = user["phone_number"]
@@ -213,7 +234,6 @@ async def run_daily_checkins(current_hour_utc: "int | None" = None) -> None:
         except Exception as e:
             logger.error(f"❌ Unhandled error sending check-in to {phone_number}: {e}", exc_info=True)
 
-    logger.info(f"📅 Daily check-in run finished for hour {current_hour_utc}:00 UTC.")
 
 
 _REPAIR_COOLDOWN_SECONDS = 240
@@ -268,33 +288,36 @@ async def repair_missing_plans() -> None:
 _REPAIR_INTERVAL_SECONDS = 120
 
 
+_CHECKIN_POLL_SECONDS = 600
+
+
 async def _run_forever() -> None:
     """
-    Scheduler loop: wakes up once a minute and, once per UTC calendar
-    hour, runs the batch for that hour. Needed now that each user can
-    have their own preferred check-in hour (see app/onboarding.py
-    question 8 and memory.set_preferred_checkin_hour) instead of
-    everyone sharing one fixed settings.DAILY_CHECKIN_HOUR_UTC.
+    Scheduler loop. Every few minutes it sends today's check-in to every
+    active premium user whose daily slot (their chosen hour, or
+    settings.DAILY_CHECKIN_HOUR_UTC) has started and who hasn't received
+    today's message yet. Because it catches up instead of firing only
+    inside the exact hour, a container restart / deploy / brief outage
+    around the scheduled time no longer makes a user miss the day.
+    Also runs the paid-user plan repair job every couple of minutes.
     """
-    last_run_key = None
+    last_checkin_at = 0.0
     last_repair_at = 0.0
     logger.info(
-        "Daily check-in scheduler started - checking every hour for users "
-        "whose preferred check-in hour matches."
+        f"Daily check-in scheduler started - default slot {settings.DAILY_CHECKIN_HOUR_UTC}:00 UTC, "
+        f"polling every {_CHECKIN_POLL_SECONDS // 60} min (catch-up enabled)."
     )
     while True:
-        now = datetime.utcnow()
-        run_key = (now.date(), now.hour)
-        if run_key != last_run_key:
+        if time.monotonic() - last_checkin_at >= _CHECKIN_POLL_SECONDS or last_checkin_at == 0.0:
+            last_checkin_at = time.monotonic()
             try:
-                await run_daily_checkins(current_hour_utc=now.hour)
+                await run_daily_checkins()
             except Exception as e:
                 logger.error(f"❌ Daily check-in run crashed: {e}", exc_info=True)
-            last_run_key = run_key
         if time.monotonic() - last_repair_at >= _REPAIR_INTERVAL_SECONDS:
             last_repair_at = time.monotonic()
             await repair_missing_plans()
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 
 if __name__ == "__main__":
